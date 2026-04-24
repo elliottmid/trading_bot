@@ -30,7 +30,11 @@ class Config:
     schwab_token_path: str = "/Users/elliottmiddleton/trading-bot/token.json"
 
     # --- Trading universe ---
-    symbols: List[str] = field(default_factory=lambda: ["SPY", "QQQ", "IWM"])
+    symbols: List[str] = field(default_factory=lambda: [
+        "SPY", "QQQ", "IWM",
+        "SCHD", "BRK/B", "BTC", "CHAT", "DIA", "EEM", "EWH",
+        "FXI", "ILF", "PHYS", "PSLV", "RSP",
+    ])
     live_trading: bool = False
     dry_run: bool = True
     loop_interval_seconds: int = 60
