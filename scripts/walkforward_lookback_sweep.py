@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # Author: Elliott Middleton, assisted by Claude
-# Date: 2026-06-02
-# Description: Sweep IS lookback window (60–180 months, step 12) in walk-forward EMA
+# Date: 2026-06-03
+# Description: Sweep IS lookback window (60–180 months, step 12) in walk-forward MA
 #              optimization to find the optimal lookback for SPY and QQQ (2010–2026 OOS).
-#              Grid: EMA entry/exit pairs × trailing stop 3–6%. IS objective: Sharpe.
+#              Grid: MA entry/exit pairs × trailing stop 3–6%. IS objective: Sharpe.
+#              MA type selectable: ema (default) or sma.
 #              Outputs: CSV, PNG chart, and date-stamped markdown report to results/.
 
 from __future__ import annotations
@@ -69,12 +70,15 @@ def build_combos() -> list[tuple[int, int, int, int, float]]:
     return combos
 
 
-# ── EMA computation ───────────────────────────────────────────────────────────
+# ── MA computation ─────────────────────────────────────────────────────────────
 
-def add_emas(df: pd.DataFrame, periods: list[int]) -> pd.DataFrame:
+def add_mas(df: pd.DataFrame, periods: list[int], ma_type: str) -> pd.DataFrame:
     df = df.copy()
     for p in sorted(set(periods)):
-        df[f"ema_{p}"] = df["close"].ewm(span=p, adjust=False).mean()
+        if ma_type == "ema":
+            df[f"ma_{p}"] = df["close"].ewm(span=p, adjust=False).mean()
+        else:
+            df[f"ma_{p}"] = df["close"].rolling(window=p, min_periods=p).mean()
     return df
 
 
@@ -96,6 +100,11 @@ def _sharpe_only(
 
     for i in range(2, len(close_arr)):
         sig = i - 1
+        if (np.isnan(ef_arr[sig]) or np.isnan(es_arr[sig]) or
+                np.isnan(xf_arr[sig]) or np.isnan(xs_arr[sig]) or
+                np.isnan(ef_arr[sig - 1]) or np.isnan(es_arr[sig - 1]) or
+                np.isnan(xf_arr[sig - 1]) or np.isnan(xs_arr[sig - 1])):
+            continue
         entry_cross = ef_arr[sig] > es_arr[sig] and ef_arr[sig - 1] <= es_arr[sig - 1]
         exit_cross  = xf_arr[sig] < xs_arr[sig] and xf_arr[sig - 1] >= xs_arr[sig - 1]
         daily_ret   = 0.0
@@ -130,7 +139,7 @@ def _sharpe_only(
 
 def _run_is_batch(
     close_arr:   np.ndarray,
-    ema_dict:    dict[int, np.ndarray],
+    ma_dict:     dict[int, np.ndarray],
     combo_batch: list[tuple[int, int, int, int, float]],
     tc_frac:     float,
 ) -> list[tuple[float, tuple[int, int, int, int, float]]]:
@@ -138,8 +147,8 @@ def _run_is_batch(
         (
             _sharpe_only(
                 close_arr,
-                ema_dict[ef], ema_dict[es],
-                ema_dict[xf], ema_dict[xs],
+                ma_dict[ef], ma_dict[es],
+                ma_dict[xf], ma_dict[xs],
                 ts, tc_frac,
             ),
             (ef, es, xf, xs, ts),
@@ -158,20 +167,25 @@ def backtest_full(
     tc_frac: float,
 ) -> dict:
     close_arr = sym_df["close"].to_numpy()
-    ef_arr    = sym_df[f"ema_{ef}"].to_numpy()
-    es_arr    = sym_df[f"ema_{es}"].to_numpy()
-    xf_arr    = sym_df[f"ema_{xf}"].to_numpy()
-    xs_arr    = sym_df[f"ema_{xs}"].to_numpy()
+    ef_arr    = sym_df[f"ma_{ef}"].to_numpy()
+    es_arr    = sym_df[f"ma_{es}"].to_numpy()
+    xf_arr    = sym_df[f"ma_{xf}"].to_numpy()
+    xs_arr    = sym_df[f"ma_{xs}"].to_numpy()
     n         = len(close_arr)
 
     in_pos = False
     entry_price = peak = prev_eq = 0.0
     pnls:       list[float] = []
     daily_rets  = np.zeros(n)
-    trail_exits = ema_exits = 0
+    trail_exits = ma_exits = 0
 
     for i in range(2, n):
         sig = i - 1
+        if (np.isnan(ef_arr[sig]) or np.isnan(es_arr[sig]) or
+                np.isnan(xf_arr[sig]) or np.isnan(xs_arr[sig]) or
+                np.isnan(ef_arr[sig - 1]) or np.isnan(es_arr[sig - 1]) or
+                np.isnan(xf_arr[sig - 1]) or np.isnan(xs_arr[sig - 1])):
+            continue
         entry_cross = ef_arr[sig] > es_arr[sig] and ef_arr[sig - 1] <= es_arr[sig - 1]
         exit_cross  = xf_arr[sig] < xs_arr[sig] and xf_arr[sig - 1] >= xs_arr[sig - 1]
 
@@ -192,7 +206,7 @@ def backtest_full(
                 daily_rets[i] -= tc_frac
                 pnls.append(eq - tc_frac)
                 trail_exits += int(trail_hit)
-                ema_exits   += int(not trail_hit)
+                ma_exits    += int(not trail_hit)
                 in_pos  = False
                 prev_eq = 0.0
 
@@ -223,14 +237,14 @@ def backtest_full(
         "max_dd":        max_dd,
         "win_rate":      win_rate,
         "trail_exits":   trail_exits,
-        "ema_exits":     ema_exits,
+        "ma_exits":      ma_exits,
         "bh_return":     bh_ret,
     }
 
 
 # ── lookback sweep ────────────────────────────────────────────────────────────
 
-def run_lookback_sweep(df: pd.DataFrame, n_jobs: int = -1) -> pd.DataFrame:
+def run_lookback_sweep(df: pd.DataFrame, ma_type: str, n_jobs: int = -1) -> pd.DataFrame:
     combos  = build_combos()
     tc_frac = TC_BPS / 10_000
 
@@ -238,7 +252,7 @@ def run_lookback_sweep(df: pd.DataFrame, n_jobs: int = -1) -> pd.DataFrame:
     n_workers   = cpu_count() if n_jobs < 0 else max(1, n_jobs)
     chunk       = math.ceil(len(combos) / n_workers)
     batches     = [combos[i : i + chunk] for i in range(0, len(combos), chunk)]
-    logger.info(f"Parallel workers={n_workers}  batch size={chunk}")
+    logger.info(f"MA type={ma_type.upper()}  Parallel workers={n_workers}  batch size={chunk}")
 
     n_total = len(LOOKBACK_MONTHS) * len(WF_YEARS) * len(SYMBOLS)
     logger.info(
@@ -266,12 +280,11 @@ def run_lookback_sweep(df: pd.DataFrame, n_jobs: int = -1) -> pd.DataFrame:
                     .reset_index(drop=True)
                 )
 
-                # IS slice: exact month-based window
                 is_mask = (
                     (sym_all["timestamp"] >= is_start_date) &
                     (sym_all["timestamp"] <= is_end_date)
                 )
-                is_df = add_emas(sym_all[is_mask].copy(), all_periods)
+                is_df = add_mas(sym_all[is_mask].copy(), all_periods, ma_type)
 
                 if len(is_df) < MIN_IS_BARS:
                     logger.debug(
@@ -280,12 +293,11 @@ def run_lookback_sweep(df: pd.DataFrame, n_jobs: int = -1) -> pd.DataFrame:
                     )
                     continue
 
-                is_close    = is_df["close"].to_numpy()
-                is_ema_dict = {p: is_df[f"ema_{p}"].to_numpy() for p in all_periods}
+                is_close  = is_df["close"].to_numpy()
+                is_ma_dict = {p: is_df[f"ma_{p}"].to_numpy() for p in all_periods}
 
-                # Parallel IS grid search
                 batch_res = Parallel(n_jobs=n_jobs)(
-                    delayed(_run_is_batch)(is_close, is_ema_dict, batch, tc_frac)
+                    delayed(_run_is_batch)(is_close, is_ma_dict, batch, tc_frac)
                     for batch in batches
                 )
                 flat = [item for sub in batch_res for item in sub]
@@ -295,16 +307,14 @@ def run_lookback_sweep(df: pd.DataFrame, n_jobs: int = -1) -> pd.DataFrame:
                 logger.info(
                     f"  {symbol} {oos_year} lb={lb_months}m: "
                     f"IS Sharpe={best_is_sharpe:.3f}  "
-                    f"EMA({ef}/{es}) x EMA({xf}/{xs}) trail={ts:.0%}"
+                    f"{ma_type.upper()}({ef}/{es}) x {ma_type.upper()}({xf}/{xs}) trail={ts:.0%}"
                 )
 
-                # OOS: EMAs initialised on full [is_start → oos_year] window to
-                # prevent look-ahead contamination from the OOS year's own data.
                 combined_mask = (
                     (sym_all["timestamp"] >= is_start_date) &
                     (sym_all["timestamp"].dt.year <= oos_year)
                 )
-                combined_df = add_emas(sym_all[combined_mask].copy(), [ef, es, xf, xs])
+                combined_df = add_mas(sym_all[combined_mask].copy(), [ef, es, xf, xs], ma_type)
                 oos_df      = combined_df[combined_df["timestamp"].dt.year == oos_year].copy()
 
                 if len(oos_df) < 20:
@@ -368,11 +378,14 @@ def compute_summary(results_df: pd.DataFrame) -> pd.DataFrame:
 
 # ── console output ────────────────────────────────────────────────────────────
 
-def print_console_results(results_df: pd.DataFrame, summary_df: pd.DataFrame) -> None:
+def print_console_results(
+    results_df: pd.DataFrame, summary_df: pd.DataFrame, ma_type: str
+) -> None:
     sep = "=" * 110
+    mt  = ma_type.upper()
     print(f"\n{sep}")
     print(
-        "EMA LOOKBACK SWEEP — AGGREGATE OOS RESULTS  "
+        f"{mt} LOOKBACK SWEEP — AGGREGATE OOS RESULTS  "
         f"(Sharpe-optimized IS → OOS, 2010–2026, {TC_BPS} bps TC)"
     )
     print(sep)
@@ -413,8 +426,7 @@ def print_console_results(results_df: pd.DataFrame, summary_df: pd.DataFrame) ->
 
     print(f"\n{sep}\n")
 
-    # Cross-symbol ranking by avg Sharpe
-    print("COMBINED RANKING  (avg OOS Sharpe across SPY + QQQ, equal-weight)")
+    print(f"COMBINED RANKING  (avg OOS Sharpe across SPY + QQQ, equal-weight)")
     print("─" * 60)
     combined = (
         summary_df.groupby("lookback_months")["avg_sharpe"]
@@ -423,7 +435,6 @@ def print_console_results(results_df: pd.DataFrame, summary_df: pd.DataFrame) ->
         .rename(columns={"avg_sharpe": "combined_avg_sharpe"})
         .sort_values("combined_avg_sharpe", ascending=False)
     )
-    combined["lookback_years"] = combined["lookback_months"] / 12
     for rank, (_, row) in enumerate(combined.iterrows(), 1):
         star = "★" if rank == 1 else " "
         print(
@@ -439,25 +450,26 @@ def print_console_results(results_df: pd.DataFrame, summary_df: pd.DataFrame) ->
 def write_markdown(
     results_df: pd.DataFrame,
     summary_df: pd.DataFrame,
+    ma_type:    str,
     today_str:  str,
 ) -> Path:
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    md_path = RESULT_DIR / f"ema_lookback_sweep_{today_str}.md"
+    mt      = ma_type.upper()
+    md_path = RESULT_DIR / f"{ma_type}_lookback_sweep_{today_str}.md"
 
     lines: list[str] = []
 
     lines += [
-        f"# EMA IS Lookback Sweep — Results",
+        f"# {mt} IS Lookback Sweep — Results",
         f"",
         f"**Generated:** {today_str}  ",
         f"**OOS period:** 2010–2026  |  **IS objective:** Sharpe maximization  |  **TC:** {TC_BPS} bps  ",
         f"**Lookbacks tested:** {', '.join(str(lb) for lb in LOOKBACK_MONTHS)} months  ",
-        f"**Grid:** EMA entry (fast 3–12, slow 8–26) × EMA exit (same) × trailing stop "
+        f"**Grid:** {mt} entry (fast 3–12, slow 8–26) × {mt} exit (same) × trailing stop "
         f"{', '.join(f'{ts:.0%}' for ts in TRAIL_STOPS)}  ",
         f"",
     ]
 
-    # Executive summary
     lines += ["## Executive Summary", ""]
     for sym in SYMBOLS:
         sub         = summary_df[summary_df["symbol"] == sym]
@@ -477,7 +489,6 @@ def write_markdown(
             f"",
         ]
 
-    # Combined ranking
     combined = (
         summary_df.groupby("lookback_months")["avg_sharpe"]
         .mean()
@@ -498,7 +509,6 @@ def write_markdown(
         )
     lines += [""]
 
-    # Per-symbol aggregate tables
     for sym in SYMBOLS:
         lines += [f"## {sym} — Aggregate Results by Lookback", ""]
         lines += [
@@ -519,14 +529,13 @@ def write_markdown(
             )
         lines += [""]
 
-    # Year-by-year for best lookback per symbol
     lines += ["## Year-by-Year OOS Performance — Best Lookback per Symbol", ""]
     for sym in SYMBOLS:
         sub_sum = summary_df[summary_df["symbol"] == sym]
         best_lb = int(sub_sum.loc[sub_sum["avg_sharpe"].idxmax(), "lookback_months"])
         lines += [
             f"### {sym} — {best_lb}-month IS window (best avg OOS Sharpe)", "",
-            "| Year | Entry EMA | Exit EMA | Trail | IS Sharpe | OOS CAGR | "
+            f"| Year | Entry {mt} | Exit {mt} | Trail | IS Sharpe | OOS CAGR | "
             "OOS Sharpe | OOS MaxDD | Trades | Win% | Buy-Hold |",
             "|---|---|---|---|---|---|---|---|---|---|---|",
         ]
@@ -550,15 +559,14 @@ def write_markdown(
             )
         lines += [""]
 
-    # Methodology
     lines += [
         "## Methodology Notes", "",
         "- **IS window:** Exact calendar months (DateOffset) ending Dec 31 of (OOS year − 1). "
         "Not year-aligned — a 60-month window ending 2014-12-31 starts ~2009-12-31 regardless "
         "of how many trading years that spans.",
-        "- **OOS window:** One full calendar year. EMAs are initialised on the IS window then "
+        f"- **OOS window:** One full calendar year. {mt}s are initialised on the IS window then "
         "the OOS year is sliced out, preventing look-ahead contamination.",
-        "- **Grid:** 122,500 combinations (EMA entry pairs × EMA exit pairs × 4 trailing stops). "
+        f"- **Grid:** 122,500 combinations ({mt} entry pairs × {mt} exit pairs × 4 trailing stops). "
         "IS objective: Sharpe ratio maximization. TC: 5 bps round-trip.",
         "- **Chain CAGR:** Geometric chain-link of raw OOS holding-period returns across all "
         "OOS years, annualised by number of OOS years. Not arithmetic average of annual CAGRs.",
@@ -575,16 +583,17 @@ def write_markdown(
 
 # ── chart ─────────────────────────────────────────────────────────────────────
 
-def plot_sweep(summary_df: pd.DataFrame, today_str: str) -> None:
+def plot_sweep(summary_df: pd.DataFrame, ma_type: str, today_str: str) -> None:
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = RESULT_DIR / f"ema_lookback_sweep_{today_str}.png"
+    mt       = ma_type.upper()
+    out_path = RESULT_DIR / f"{ma_type}_lookback_sweep_{today_str}.png"
 
     colors = {"SPY": "#1f77b4", "QQQ": "#ff7f0e"}
     x_lbs  = LOOKBACK_MONTHS
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
-        f"EMA IS Lookback Sweep — SPY & QQQ (2010–2026 OOS, Sharpe-optimized IS, {TC_BPS} bps TC)\n"
+        f"{mt} IS Lookback Sweep — SPY & QQQ (2010–2026 OOS, Sharpe-optimized IS, {TC_BPS} bps TC)\n"
         "IS window: 60–180 months (step 12)",
         fontsize=12,
     )
@@ -603,10 +612,7 @@ def plot_sweep(summary_df: pd.DataFrame, today_str: str) -> None:
             lbs  = sub["lookback_months"].tolist()
             ax.plot(lbs, vals, marker="o", label=sym, color=colors[sym], linewidth=2, markersize=6)
 
-            # Mark best
-            best_idx = int(np.argmax(vals)) if col != "avg_max_dd" else int(np.argmax(vals))
-            if col == "avg_max_dd":   # lower is better
-                best_idx = int(np.argmin(vals))
+            best_idx = int(np.argmin(vals)) if col == "avg_max_dd" else int(np.argmax(vals))
             ax.plot(
                 lbs[best_idx], vals[best_idx],
                 marker="*", markersize=14, color=colors[sym], zorder=5,
@@ -633,10 +639,14 @@ def plot_sweep(summary_df: pd.DataFrame, today_str: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Sweep IS lookback (60–180 months, step 12) in walk-forward EMA optimization. "
+            "Sweep IS lookback (60–180 months, step 12) in walk-forward MA optimization. "
             f"Runs {len(LOOKBACK_MONTHS)} × {len(WF_YEARS)} OOS years × {len(SYMBOLS)} symbols "
             f"= {len(LOOKBACK_MONTHS)*len(WF_YEARS)*len(SYMBOLS)} IS grid searches."
         )
+    )
+    parser.add_argument(
+        "--ma-type", choices=("ema", "sma"), default="ema",
+        help="Moving average type: ema (default) or sma"
     )
     parser.add_argument(
         "--jobs", type=int, default=-1,
@@ -646,7 +656,7 @@ def main() -> None:
 
     today_str  = date.today().isoformat()
     df         = load_data()
-    results_df = run_lookback_sweep(df, n_jobs=args.jobs)
+    results_df = run_lookback_sweep(df, ma_type=args.ma_type, n_jobs=args.jobs)
 
     if results_df.empty:
         logger.error("No results — check data coverage (need 2000-present for SPY+QQQ).")
@@ -654,11 +664,11 @@ def main() -> None:
 
     summary_df = compute_summary(results_df)
 
-    print_console_results(results_df, summary_df)
-    plot_sweep(summary_df, today_str)
+    print_console_results(results_df, summary_df, ma_type=args.ma_type)
+    plot_sweep(summary_df, ma_type=args.ma_type, today_str=today_str)
 
-    md_path  = write_markdown(results_df, summary_df, today_str)
-    csv_path = RESULT_DIR / f"ema_lookback_sweep_{today_str}.csv"
+    md_path  = write_markdown(results_df, summary_df, ma_type=args.ma_type, today_str=today_str)
+    csv_path = RESULT_DIR / f"{args.ma_type}_lookback_sweep_{today_str}.csv"
     results_df.to_csv(csv_path, index=False)
 
     logger.info(f"Results CSV → {csv_path}")
