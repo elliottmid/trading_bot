@@ -39,6 +39,9 @@ Paths are relative to repo root.
 | `backtest_ema_qqq_grid.py` | Grid search over EMA entry/exit pairs × trailing stop levels (1–6%) on QQQ 2000–present. Output: `data/models/ema_qqq_grid_results.csv` |
 | `backtest_ema_qqq_full.py` | Full 26-year backtest of winning QQQ parameters. Output: `data/models/ema_qqq_trades.csv`, `data/models/ema_qqq_equity_curve.csv` |
 | `ema_spy_qqq_scan.py` | **Daily close scanner** — SPY + QQQ with individually optimised parameters. Reports signal, open trade entry/peak/stop, or BUY instructions with initial stop price. Run after market close. |
+| `walkforward_ema_optimization.py` | Annual walk-forward: finds Sharpe-maximizing EMA entry/exit + trailing stop (3–6%) on prior 9-year IS window (108-month optimum), applies to next calendar year OOS. 122,500 combos, joblib parallel. Outputs CSV + equity curve chart to `results/`. |
+| `walkforward_lookback_sweep.py` | Outer loop over IS window length (60–180m, step 12) for both SPY and QQQ. Runs full 2010–2026 walk-forward at each length. Identifies 108m as optimal. Outputs CSV + markdown report + 4-panel chart to `results/`. |
+| `ma_adaptive_scan.py` | Adaptive daily scanner — runs IS grid search on past 9 years (cached 30d), reports today's signal for SPY and QQQ. Supports EMA/SMA/Wilder MA types via `--ma-type`. |
 
 ## Credentials
 
@@ -199,6 +202,49 @@ Fetches 2 years of history via yfinance, reconstructs current open trade for eac
 - **FLAT** — no position, no signal; shows current EMA gap
 
 No launchd wrapper needed — user runs manually after close.
+
+### Annual walk-forward parameter validation (updated 2026-06-03)
+
+Script: `walkforward_ema_optimization.py` — outputs to `results/`.
+
+**Design:** For each OOS year 2010–2026, grid-search 122,500 combos (EMA entry/exit pairs × trailing stops 3–6%) on the prior 9 calendar years (108-month optimum — see lookback sweep below), maximizing IS **Sharpe ratio**. Apply winning params to the next calendar year OOS. 5 bps TC.
+
+**Aggregate OOS results (Sharpe-optimized IS, 108-month window):**
+
+| Ticker | Chain-linked CAGR | Hit rate | Avg OOS Sharpe | Avg OOS MaxDD |
+|---|---|---|---|---|
+| SPY | +4.19% | 76% (13/17 years) | 0.910 | -8.0% |
+| QQQ | +5.43% | 59% (10/17 years) | 0.948 | -9.8% |
+
+**Key findings:**
+- **IS→OOS decay is large.** IS Sharpe averages 0.3–0.9 in 2010–2019 folds; OOS returns average 4–5%. Validates direction of edge but IS Sharpe is not a return forecast.
+- **Sharpe optimization is strictly better for QQQ** on all metrics vs CAGR-optimized. SPY shows better CAGR, hit rate, and MaxDD with 108m vs prior 120m window.
+- **Single most important year:** 2022 QQQ — CAGR-optimized lost −31% OOS; Sharpe-optimized lost only −5.1% while buy-hold lost −33.2%. This alone validates the Sharpe criterion.
+- **Trailing stops are stable.** SPY: 6% in 2010–2019, shifting to 3% in 2020–2026 as regime IS data changed. QQQ: 5–6% across all 17 windows.
+- **Scanner parameters should not be updated to walk-forward winners.** The scanner's Sharpe-optimized params (EMA 12/16 entry, 8/10 exit, 6% trail for SPY; 12/24 entry, 10/23 exit, 5% trail for QQQ) were selected on the full 2000–2019 IS window — a longer, more stable base than any 9-year rolling window.
+- **Worst years: 2011, 2018, 2022** (volatile declining markets). Best years: 2020 QQQ +33.6%, 2019 SPY +16.4%, 2025 QQQ +19.6%, 2024 SPY +15.0%.
+
+### IS lookback sweep (2026-06-02)
+
+Script: `walkforward_lookback_sweep.py` — sweeps IS window from 60 to 180 months (step 12) for both SPY and QQQ, running the full 2010–2026 annual walk-forward at each window length. Output: `results/ema_lookback_sweep_YYYY-MM-DD.{csv,md,png}`.
+
+**Finding: 108 months is the optimal IS window for both symbols.**
+
+| Lookback | SPY Sharpe | SPY CAGR | SPY Hit | QQQ Sharpe | QQQ CAGR | QQQ Hit | Combined |
+|---|---|---|---|---|---|---|---|
+| 60m | 0.811 | +3.71% | 71% | 0.826 | +3.18% | 65% | 0.819 |
+| 84m | 0.834 | +3.93% | 71% | 0.842 | −1.33% | 47% | 0.838 |
+| 96m | 0.855 | +4.13% | 71% | 0.875 | +4.58% | 59% | 0.865 |
+| **108m** | **0.910** | **+4.19%** | **76%** | **0.948** | **+5.43%** | **59%** | **0.929** |
+| 120m | 0.797 | +3.29% | 65% | 0.894 | +4.45% | 65% | 0.845 |
+| 144m | 0.784 | +3.17% | 59% | 0.852 | +3.83% | 59% | 0.818 |
+| 180m | 0.731 | +3.24% | 59% | 0.800 | +3.52% | 53% | 0.766 |
+
+**Key findings:**
+- **Short-lookback trap (60–84m):** High IS Sharpe (up to 1.77) but poor OOS — classic overfitting. QQQ at 84m loses money (−1.33% chain CAGR).
+- **Goldilocks zone: 96–120m.** Performance peaks at 108m and decays monotonically in both directions beyond that range.
+- **120m (prior default) ranked #2** combined (0.845 vs 0.929). Close but 108m is strictly better on all metrics for SPY; better on Sharpe/CAGR for QQQ.
+- **IS Sharpe is not a reliable OOS predictor at short windows.** Correlation between IS and OOS Sharpe breaks down below ~96m due to overfitting.
 
 ## What the next approach should address
 
