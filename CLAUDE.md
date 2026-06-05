@@ -40,7 +40,8 @@ Paths are relative to repo root.
 | `backtest_ema_qqq_full.py` | Full 26-year backtest of winning QQQ parameters. Output: `data/models/ema_qqq_trades.csv`, `data/models/ema_qqq_equity_curve.csv` |
 | `ema_spy_qqq_scan.py` | **Daily close scanner** — SPY + QQQ with individually optimised parameters. Reports signal, open trade entry/peak/stop, or BUY instructions with initial stop price. Run after market close. |
 | `walkforward_ema_optimization.py` | Annual walk-forward: finds Sharpe-maximizing EMA entry/exit + trailing stop (3–6%) on prior 9-year IS window (108-month optimum), applies to next calendar year OOS. 122,500 combos, joblib parallel. Outputs CSV + equity curve chart to `results/`. |
-| `walkforward_lookback_sweep.py` | Outer loop over IS window length (60–180m, step 12) for both SPY and QQQ. Runs full 2010–2026 walk-forward at each length. Identifies 108m as optimal. Outputs CSV + markdown report + 4-panel chart to `results/`. |
+| `walkforward_sma_optimization.py` | Same as EMA version but for SMA. Prior 14-year IS window (168-month lookback-sweep optimum). 122,500 combos, joblib parallel. Outputs CSV + equity curve chart to `results/`. |
+| `walkforward_lookback_sweep.py` | Outer loop over IS window length (60–180m, step 12) for both SPY and QQQ. Supports `--ma-type ema\|sma`. EMA: identifies 108m optimum. SMA: identifies 168m optimum. Outputs CSV + markdown report + 4-panel chart to `results/`. |
 | `ma_adaptive_scan.py` | Adaptive daily scanner — runs IS grid search on past 9 years (cached 30d), reports today's signal for SPY and QQQ. Supports EMA/SMA/Wilder MA types via `--ma-type`. |
 
 ## Credentials
@@ -245,6 +246,62 @@ Script: `walkforward_lookback_sweep.py` — sweeps IS window from 60 to 180 mont
 - **Goldilocks zone: 96–120m.** Performance peaks at 108m and decays monotonically in both directions beyond that range.
 - **120m (prior default) ranked #2** combined (0.845 vs 0.929). Close but 108m is strictly better on all metrics for SPY; better on Sharpe/CAGR for QQQ.
 - **IS Sharpe is not a reliable OOS predictor at short windows.** Correlation between IS and OOS Sharpe breaks down below ~96m due to overfitting.
+
+## SMA crossover strategy walk-forward results (added 2026-06-05)
+
+Parallel to the EMA walk-forward above, using SMA with 14-year IS window (168m — see SMA lookback sweep below).
+
+### Annual walk-forward parameter validation
+
+Script: `walkforward_sma_optimization.py` — outputs to `results/`.
+
+**Design:** Identical to EMA version: annual OOS 2010–2026, 122,500 combos (SMA entry/exit pairs × trailing stops 3–6%), IS Sharpe maximization, 5 bps TC. IS window = 14 calendar years (168m lookback-sweep optimum).
+
+**Aggregate OOS results (Sharpe-optimized IS, 168-month window):**
+
+| Ticker | Chain-linked CAGR | Hit rate | Avg OOS Sharpe | Avg OOS MaxDD |
+|---|---|---|---|---|
+| SPY | +3.8% | 82% (14/17 years) | 0.79 | -8.2% |
+| QQQ | +6.5% | 65% (11/17 years) | 0.92 | -10.8% |
+
+**SMA vs EMA comparison:**
+
+| Metric | SPY EMA | SPY SMA | QQQ EMA | QQQ SMA |
+|---|---|---|---|---|
+| Chain CAGR | +4.2% | +3.8% | +5.6% | +6.5% |
+| Hit rate | 76% | **82%** | 65% | 65% |
+| Avg Sharpe | **0.91** | 0.79 | **0.97** | 0.92 |
+| Avg MaxDD | **-8.1%** | -8.2% | **-9.1%** | -10.8% |
+
+**Key findings:**
+- **SMA SPY hits more years (82% vs 76%)** but with lower Sharpe and CAGR — more consistent but smaller gains each year.
+- **SMA QQQ has higher chain CAGR (+6.5% vs +5.6%)** driven by 2017 (+26.4%) and 2025 (+20.4%); Sharpe lower due to worse downside in loss years (-13.4% in 2018, -5.5% in 2022).
+- **Trailing stops stable:** SPY almost entirely 6% across all 17 windows; QQQ almost entirely 5%.
+- **Worst years for both MA types:** 2018 (volatile chop) and 2022 (sustained bear). EMA slightly edges SMA in 2022 on both symbols.
+- **EMA is superior on risk-adjusted basis (Sharpe)** for both symbols. SMA's QQQ CAGR edge is not enough to compensate for higher drawdowns.
+
+### SMA IS lookback sweep (2026-06-04)
+
+Script: `walkforward_lookback_sweep.py --ma-type sma` — sweeps IS window 60–180m (step 12), 2010–2026 walk-forward. Output: `results/sma_lookback_sweep_2026-06-04.{csv,md,png}`.
+
+**Finding: 168 months (14yr) is the optimal IS window for SMA — 5 years longer than EMA's 108m optimum.**
+
+| Lookback | SPY Sharpe | SPY CAGR | SPY Hit | QQQ Sharpe | QQQ CAGR | QQQ Hit | Combined |
+|---|---|---|---|---|---|---|---|
+| 60m | 0.556 | +3.91% | 65% | 0.482 | +1.80% | 59% | 0.519 |
+| 84m | 0.794 | +4.96% | 65% | 0.586 | +2.84% | 65% | 0.690 |
+| 96m | **0.951** | **+7.10%** | **71%** | 0.578 | +2.56% | 59% | 0.765 |
+| 108m | 0.660 | +3.40% | 65% | 0.791 | +4.89% | 71% | 0.725 |
+| 132m | 0.810 | +4.64% | 71% | 0.731 | +5.37% | 71% | 0.770 |
+| **168m** | 0.786 | +3.67% | **82%** | **0.916** | **+6.42%** | **65%** | **0.851** |
+| 180m | 0.634 | +3.43% | 71% | 0.645 | +4.22% | 65% | 0.640 |
+
+**Key findings:**
+- **SPY and QQQ disagree:** SPY peaks at 96m (Sharpe 0.951), QQQ peaks at 168m (Sharpe 0.916). 168m wins on combined ranking due to QQQ dominance.
+- **SMA needs more history than EMA.** Equal weighting of all past bars (SMA) requires more data to stabilize parameter selection vs exponential decay (EMA).
+- **Short-lookback trap confirmed:** IS Sharpe declines monotonically with longer lookbacks (1.40 at 60m SPY → 0.85 at 180m), but OOS peaks at 168m. IS Sharpe is anti-correlated with OOS at long windows.
+- **No clean Goldilocks zone** unlike EMA (96–120m). SMA performance is more jagged across window lengths, reinforcing that SMA parameter selection is less stable.
+- **96m is SPY-only optimal** — QQQ at 96m is second-worst (Sharpe 0.578, CAGR +2.56%). Using 96m for both would severely penalize QQQ.
 
 ## What the next approach should address
 
