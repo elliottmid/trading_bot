@@ -7,7 +7,7 @@ search used in walkforward_ma_optimization.py on a lookback-sweep-optimal IS
 window (EMA/Wilder: 9yr / 108m; SMA: 14yr / 168m), then applies those params
 to reconstruct the current trade state and report today's signal.
 
-Moving average type is selectable: sma (default), ema, or wilder.
+Moving average type is selectable: ema (default), sma, or wilder.
 
 Because the grid search takes ~3–6 minutes, optimized parameters are cached
 to data/models/ma_adaptive_params.json. On subsequent runs the cache is reused
@@ -16,8 +16,8 @@ unless --reoptimize is passed or the cache is more than --cache-days old
 
 Usage
 -----
-    python3 ma_adaptive_scan.py                    # SMA, use/refresh cache
-    python3 ma_adaptive_scan.py --ma-type ema      # EMA
+    python3 ma_adaptive_scan.py                    # EMA (default), use/refresh cache
+    python3 ma_adaptive_scan.py --ma-type sma      # SMA
     python3 ma_adaptive_scan.py --ma-type wilder   # Wilder smoothing
     python3 ma_adaptive_scan.py --reoptimize       # force fresh grid search
     python3 ma_adaptive_scan.py --cache-days 0     # always reoptimize
@@ -431,7 +431,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Adaptive daily MA scanner — reoptimizes params from lookback-sweep-optimal IS window (EMA/Wilder: 9yr, SMA: 14yr)"
     )
-    parser.add_argument("--ma-type",    choices=MA_TYPES, default="sma")
+    parser.add_argument("--ma-type",    choices=MA_TYPES, default="ema")
     parser.add_argument("--reoptimize", action="store_true",
                         help="Ignore cache and rerun grid search")
     parser.add_argument("--cache-days", type=int, default=30,
