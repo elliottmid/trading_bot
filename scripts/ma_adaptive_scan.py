@@ -3,10 +3,9 @@
 Adaptive daily MA signal scanner — SPY and QQQ.
 
 Finds Sharpe-maximizing entry/exit MA parameters by running the same IS grid
-search used in walkforward_ma_optimization.py on the past 9 calendar years
-(108-month window — optimal per lookback sweep results 2026-06-02),
-then applies those params to reconstruct the current trade state and report
-today's signal.
+search used in walkforward_ma_optimization.py on a lookback-sweep-optimal IS
+window (EMA/Wilder: 9yr / 108m; SMA: 14yr / 168m), then applies those params
+to reconstruct the current trade state and report today's signal.
 
 Moving average type is selectable: sma (default), ema, or wilder.
 
@@ -44,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 CACHE_PATH  = Path(__file__).parent.parent / "data" / "models" / "ma_adaptive_params.json"
 SYMBOLS     = ["SPY", "QQQ"]
-IS_YEARS    = 9   # 108-month IS window — lookback sweep optimum (vs 120m default)
+IS_YEARS    = {"ema": 9, "sma": 14, "wilder": 9}   # lookback-sweep optima (EMA/Wilder: 108m, SMA: 168m)
 TRAIL_STOPS = [0.03, 0.04, 0.05, 0.06]
 TC_BPS      = 5
 MA_TYPES    = ("ema", "sma", "wilder")
@@ -54,7 +53,7 @@ _ICONS = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🔵", "FLAT": "⬜"}
 
 # ── data ──────────────────────────────────────────────────────────────────────
 
-def fetch_history(symbols: list[str], years: int = IS_YEARS + 1) -> dict[str, pd.DataFrame]:
+def fetch_history(symbols: list[str], years: int = 15) -> dict[str, pd.DataFrame]:
     """Fetch ~(years + buffer) of daily closes via yfinance."""
     start = (datetime.today() - timedelta(days=int(years * 365.25) + 60)).strftime("%Y-%m-%d")
     logger.info(f"Fetching {', '.join(symbols)} from {start} …")
@@ -171,7 +170,7 @@ def _run_batch(
 def optimize(sym: str, df: pd.DataFrame, ma_type: str, n_jobs: int) -> dict:
     """Run full IS grid search on the last IS_YEARS of data. Returns best params."""
     today_year = date.today().year
-    is_start   = today_year - IS_YEARS
+    is_start   = today_year - IS_YEARS[ma_type]
     is_mask    = df["date"].dt.year.between(is_start, today_year - 1)
     is_df      = df[is_mask].copy().reset_index(drop=True)
 
@@ -372,7 +371,7 @@ def print_scan(results: list[dict]) -> None:
 
     print(f"\n{'=' * 72}")
     print(f"  SPY / QQQ ADAPTIVE {mt} SCAN  —  {as_of}")
-    print(f"  Parameters: Sharpe-optimized on past {IS_YEARS} years  |  TC: {TC_BPS} bps")
+    print(f"  Parameters: Sharpe-optimized on past {IS_YEARS[results[0]['ma_type']]} years  |  TC: {TC_BPS} bps")
     print(f"{'=' * 72}")
 
     for r in results:
@@ -430,7 +429,7 @@ def print_scan(results: list[dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Adaptive daily MA scanner — reoptimizes params from past 9 years (108-month optimum)"
+        description="Adaptive daily MA scanner — reoptimizes params from lookback-sweep-optimal IS window (EMA/Wilder: 9yr, SMA: 14yr)"
     )
     parser.add_argument("--ma-type",    choices=MA_TYPES, default="sma")
     parser.add_argument("--reoptimize", action="store_true",
@@ -446,8 +445,8 @@ def main() -> None:
     if cache:
         params = {sym: cache[sym] for sym in SYMBOLS}
     else:
-        # Fetch IS data (10 years + buffer) and optimize
-        data   = fetch_history(SYMBOLS, years=IS_YEARS + 1)
+        # Fetch IS data (IS window + 1yr buffer) and optimize
+        data   = fetch_history(SYMBOLS, years=IS_YEARS[args.ma_type] + 1)
         params = {}
         for sym in SYMBOLS:
             params[sym] = optimize(sym, data[sym], args.ma_type, args.jobs)
