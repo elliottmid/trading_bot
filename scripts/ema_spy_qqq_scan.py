@@ -5,10 +5,17 @@ Daily EMA signal scanner — SPY and QQQ with individually optimised parameters.
 SPY: Entry EMA(12/16)  → Exit EMA(8/10) + 6% trailing stop
 QQQ: Entry EMA(12/24) → Exit EMA(10/23) + 5% trailing stop
 
-ML exit filter: suppresses EMA/trail exits when SP500/NDX MODERATE monthly
-regressor predicts a return above ML_THRESHOLD for the current month.
-Walk-forward validated (2010–2026): avg IS-optimal threshold −2.1% (SPY),
-+0.2% (QQQ) — using 0.0% for both as practical simplification.
+ML exit filter (EXIT-ONLY): suppresses an EMA/trail EXIT when the SP500/NDX
+MODERATE regressor forecasts a return above ML_THRESHOLD. Entries are NOT
+gated — a position is always opened on a plain EMA entry crossover. (The
+entry-gate and combined variants were tested in backtest_ema_ml_filter.py and
+deliberately not promoted: the entry gate cannot recover CAGR; only the exit
+filter lifts return while preserving the drawdown reduction.)
+
+Each MODERATE row is month-end data forecasting M+1…M+3, so it is applied to
+trading days in M+1 (a +1-month shift — no look-ahead). Walk-forward validated
+(2010–2026): avg IS-optimal exit threshold ≈ +0.2% (SPY), +0.6% (QQQ) — using
+0.0% for both as a practical, sign-only simplification.
 
 Reconstructs the current open trade from 2-year history so it can report:
   • HOLD  — entry date/price, peak price, live trailing stop level
@@ -90,17 +97,22 @@ def fetch(symbols: list[str], lookback_days: int) -> dict[str, pd.DataFrame]:
 # ── ML prediction loader ──────────────────────────────────────────────────────
 
 def load_ml_predictions() -> dict[str, dict | None]:
-    """Return most recent ML predicted return for each symbol.
+    """Return the ML predicted-return history for each symbol.
 
-    The MODERATE model is run monthly. File name encodes the generation date:
-    sp500_moderate_results_YY-MM-DD.csv → forecast for that month.
-    The scanner always uses the most recent file; glob picks up new files
-    automatically each month. Forecast is flagged stale if > 1 month old.
+    The MODERATE model is run monthly and each CSV row is **month-end** data:
+    a row dated month M is computed from M's close and forecasts the change over
+    M+1…M+3. The forecast is therefore only knowable after M closes, so it is
+    applied to trading days in M+1 (a +1-month shift, matching the backtest).
 
-    Result keys: pred (float %), gen_month (str), is_active (bool).
+    Result keys:
+      pred           – latest forecast value (float %, most recent row)
+      data_month     – vintage of that forecast (the row's own month, str)
+      applies_month  – first month the forecast applies to (data_month + 1, str)
+      pred_by_month  – {applies-period → pred} over full history, for replaying
+                       the exit filter during trade reconstruction
+      is_active      – True if the latest forecast still applies this month
     Returns None for a symbol when no file or no valid prediction row is found.
     """
-    import re
     today = pd.Timestamp.today()
     current_month = today.to_period("M")
     out: dict[str, dict | None] = {}
@@ -109,24 +121,26 @@ def load_ml_predictions() -> dict[str, dict | None]:
         if not files:
             out[sym] = None
             continue
-        fname = files[-1].name
-        m = re.search(r'(\d{2})-(\d{2})-\d{2}', fname)
-        if not m:
-            out[sym] = None
-            continue
-        yy, mm = int(m.group(1)), int(m.group(2))
-        gen_month = pd.Timestamp(year=2000 + yy, month=mm, day=1).to_period("M")
         df = pd.read_csv(files[-1], parse_dates=["Date"])
         valid = df.dropna(subset=["Predicted_Return"])
         if valid.empty:
             out[sym] = None
             continue
-        row = valid.iloc[-1]
+        # Shift +1 month: the month-M forecast applies to trading month M+1.
+        pred_by_month = {
+            (d.to_period("M") + 1): float(r)
+            for d, r in zip(valid["Date"], valid["Predicted_Return"])
+        }
+        data_month    = valid["Date"].iloc[-1].to_period("M")
+        applies_month = data_month + 1
         out[sym] = {
-            "pred":      float(row["Predicted_Return"]),
-            "gen_month": str(gen_month),
-            # Stale if forecast is more than one month old
-            "is_active": (current_month - gen_month).n <= 1,
+            "pred":          float(valid["Predicted_Return"].iloc[-1]),
+            "data_month":    str(data_month),
+            "applies_month": str(applies_month),
+            "pred_by_month": pred_by_month,
+            # Active while the latest forecast still applies to the current month
+            # (1-month tolerance: a 3-month forecast stays informative a while).
+            "is_active": (current_month - applies_month).n <= 1,
         }
     return out
 
@@ -159,14 +173,16 @@ def analyse(sym: str, df: pd.DataFrame, p: dict, ml_info: dict | None = None) ->
     entry_date  = None
     peak        = 0.0
 
-    ml_pred      = ml_info["pred"] if ml_info else None
-    ml_threshold = ML_THRESHOLD[sym]
-    ml_filter_on = (ml_info is not None and ml_info.get("is_active", False))
+    ml_pred       = ml_info["pred"] if ml_info else None
+    ml_threshold  = ML_THRESHOLD[sym]
+    ml_filter_on  = (ml_info is not None and ml_info.get("is_active", False))
+    pred_by_month = ml_info.get("pred_by_month") if ml_info else None
 
-    # Walk every bar to reconstruct current trade state.
-    # Signal at bar i fires at close of bar i; execution notionally at
-    # next open, but for end-of-day scanning we treat today's close as entry.
-    for i in range(1, len(df)):
+    # Reconstruct trade state through the *prior* bar, replaying the ML exit
+    # filter so the reported open trade matches the strategy actually run (MED-4).
+    # Today's bar (index len-1) is evaluated separately below so a live BUY/SELL
+    # can be emitted (the old loop consumed today's exit and never showed SELL).
+    for i in range(1, len(df) - 1):
         close_i = df["close"].iloc[i]
 
         entry_signal = _cross_up(df["ema_ef"], df["ema_es"], i)
@@ -182,10 +198,18 @@ def analyse(sym: str, df: pd.DataFrame, p: dict, ml_info: dict | None = None) ->
             peak = max(peak, close_i)
             trail_hit = close_i <= peak * (1 - trail)
             if trail_hit or exit_signal:
-                in_pos      = False
-                entry_price = 0.0
-                entry_date  = None
-                peak        = 0.0
+                bar_month = df["date"].iloc[i].to_period("M")
+                pr = pred_by_month.get(bar_month) if pred_by_month else None
+                if pr is not None and pr > ml_threshold:
+                    # Exit suppressed — stay long; reset the trail anchor so a hit
+                    # stop doesn't re-fire every bar (mirrors the backtest).
+                    if trail_hit:
+                        peak = close_i
+                else:
+                    in_pos      = False
+                    entry_price = 0.0
+                    entry_date  = None
+                    peak        = 0.0
 
     # ── today's bar ──────────────────────────────────────────────────────────
     last   = df.iloc[-1]
@@ -200,6 +224,7 @@ def analyse(sym: str, df: pd.DataFrame, p: dict, ml_info: dict | None = None) ->
     exit_reason   = None
 
     if in_pos:
+        peak = max(peak, close)   # today's close can set a new high → lifts stop
         trail_stop = round(peak * (1 - trail), 2)
         unrealised = (close - entry_price) / entry_price
         trail_hit       = close <= trail_stop
@@ -241,7 +266,8 @@ def analyse(sym: str, df: pd.DataFrame, p: dict, ml_info: dict | None = None) ->
         "exit_reason":  exit_reason,
         # ML filter
         "ml_pred":         ml_pred,
-        "ml_month":        ml_info["gen_month"] if ml_info else None,
+        "ml_month":        ml_info["data_month"] if ml_info else None,
+        "ml_applies":      ml_info["applies_month"] if ml_info else None,
         "ml_suppressed":   ml_suppressed,
         "ml_threshold":    ml_threshold,
         "ml_filter_on":    ml_filter_on,
@@ -266,8 +292,8 @@ def _ml_status_line(r: dict) -> str:
             return f"ML filter: OFF ({r['ml_month']} forecast is stale — re-run MODERATE model)"
         return "ML filter: OFF (no forecast file found)"
     sign = "+" if r["ml_pred"] >= 0 else ""
-    return (f"ML filter: ON  |  {r['ml_month']} forecast {sign}{r['ml_pred']:.2f}%  "
-            f"(threshold {r['ml_threshold']:+.1f}%)")
+    return (f"ML filter: ON  |  {r['ml_month']} month-end forecast {sign}{r['ml_pred']:.2f}%  "
+            f"→ applies {r['ml_applies']}+  (threshold {r['ml_threshold']:+.1f}%)")
 
 
 def print_scan(results: list[dict]) -> None:
@@ -375,11 +401,11 @@ def main() -> None:
         if info is None:
             print(f"  {sym}: no prediction file found — filter inactive")
         elif not info["is_active"]:
-            print(f"  {sym}: {info['gen_month']} forecast is stale — filter inactive")
+            print(f"  {sym}: {info['data_month']} forecast no longer applies — filter inactive")
         else:
             sign = "+" if info["pred"] >= 0 else ""
-            print(f"  {sym}: {info['gen_month']} forecast {sign}{info['pred']:.2f}%  "
-                  f"vs threshold {ML_THRESHOLD[sym]:+.1f}%")
+            print(f"  {sym}: {info['data_month']} month-end forecast {sign}{info['pred']:.2f}%  "
+                  f"(applies {info['applies_month']}+) vs threshold {ML_THRESHOLD[sym]:+.1f}%")
 
     results = [analyse(sym, data[sym], PARAMS[sym], ml_preds.get(sym)) for sym in symbols]
     print_scan(results)

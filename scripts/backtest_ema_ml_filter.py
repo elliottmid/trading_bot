@@ -51,12 +51,6 @@ def load_ml_predictions(sym):
     return df[["Date", "Predicted_Return", "Reg_Direction", "Probability_Up"]].copy()
 
 
-def load_prices(sym):
-    df = pd.read_csv(EQ_PATHS[sym], parse_dates=["date"])
-    df = df[df["date"] >= OOS_START].reset_index(drop=True)
-    return df
-
-
 def load_prices_full(sym):
     """Full price history (back to 2000) needed for IS window EMA initialization."""
     df = pd.read_csv(EQ_PATHS[sym], parse_dates=["date"])
@@ -71,88 +65,6 @@ def _ema(series, span):
 
 # ── Core simulation ───────────────────────────────────────────────────────────
 
-def simulate(prices_df, pred_dict, params, exit_thresh=None, entry_thresh=None):
-    """
-    Simulate EMA strategy with optional ML exit/entry filter.
-
-    exit_thresh  (float, % units) – suppress exit if ML pred > this. None = no filter.
-    entry_thresh (float, % units) – block entry if ML pred <= this. None = no filter.
-
-    Trail stop suppression: when trail fires and is suppressed, peak resets to
-    current close (gives a fresh stop level, prevents repeated daily triggering).
-
-    Returns: (daily_rets ndarray, n_trades int, n_suppressed_exits int, n_blocked_entries int)
-    """
-    p = params
-    df = prices_df.reset_index(drop=True)
-    closes = df["close"].values
-    dates  = df["date"].values   # numpy datetime64
-
-    ema_ef = _ema(df["close"], p["ef"])
-    ema_es = _ema(df["close"], p["es"])
-    ema_xf = _ema(df["close"], p["xf"])
-    ema_xs = _ema(df["close"], p["xs"])
-
-    n = len(closes)
-    in_pos   = False
-    peak     = 0.0
-
-    daily_rets  = np.zeros(n - 1)
-    n_trades    = 0
-    n_suppressed = 0
-    n_blocked   = 0
-
-    for i in range(1, n):
-        c_cur  = closes[i]
-        c_prev = closes[i - 1]
-
-        # Monthly prediction lookup (% units, e.g. 2.3 means +2.3%)
-        ym = pd.Timestamp(dates[i]).to_period("M")
-        pred_ret = pred_dict.get(ym, None)
-
-        if in_pos:
-            if c_cur > peak:
-                peak = c_cur
-
-            trail_exit = c_cur < peak * (1.0 - p["trail"])
-            ema_exit   = (ema_xf[i] < ema_xs[i]) and (ema_xf[i - 1] >= ema_xs[i - 1])
-
-            if trail_exit or ema_exit:
-                suppress = (exit_thresh is not None
-                            and pred_ret is not None
-                            and pred_ret > exit_thresh)
-                if suppress:
-                    n_suppressed += 1
-                    daily_rets[i - 1] = c_cur / c_prev - 1.0
-                    # Reset peak so trail doesn't fire again at the same level
-                    if trail_exit:
-                        peak = c_cur
-                else:
-                    daily_rets[i - 1] = c_cur / c_prev - 1.0
-                    in_pos = False
-                    n_trades += 1
-            else:
-                daily_rets[i - 1] = c_cur / c_prev - 1.0
-
-        else:
-            entry_signal = (ema_ef[i] > ema_es[i]) and (ema_ef[i - 1] <= ema_es[i - 1])
-
-            allow_entry = True
-            if entry_thresh is not None and pred_ret is not None:
-                allow_entry = pred_ret > entry_thresh
-            # If pred_ret is None (outside prediction window), allow entry unchanged
-
-            if entry_signal and allow_entry:
-                in_pos = True
-                peak   = c_cur
-                n_trades += 1
-                # Enter at close; daily_rets[i-1] = 0 (return begins next bar)
-            elif entry_signal and not allow_entry:
-                n_blocked += 1
-
-    return daily_rets, n_trades, n_suppressed, n_blocked
-
-
 def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                     pred_dict, params, period_start, period_end,
                     exit_thresh=None, entry_thresh=None):
@@ -161,18 +73,26 @@ def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
     Position state starts fresh (in_pos=False) at period_start — same convention
     as walkforward_ema_optimization.py.  EMA values are properly initialised
     because they are computed on the full price history before being passed in.
+
+    Returns: (daily_rets, n_trades, n_suppressed, n_blocked, max_suppressed_dd).
+    max_suppressed_dd (<=0) is the worst drawdown measured from the peak at the
+    moment an exit was first suppressed until the position is finally closed — it
+    quantifies the downside risk of holding through a suppressed stop (HIGH-3).
     """
     start_ts = np.datetime64(pd.Timestamp(period_start))
     end_ts   = np.datetime64(pd.Timestamp(period_end))
     idxs = np.where((dates >= start_ts) & (dates <= end_ts))[0]
 
     if len(idxs) < 2:
-        return np.array([]), 0, 0, 0
+        return np.array([]), 0, 0, 0, 0.0
 
     in_pos = False
     peak   = 0.0
     daily_rets = []
     n_trades = n_sup = n_blk = 0
+    supp_active = False    # currently holding past a suppressed exit
+    supp_peak   = 0.0      # peak at the moment suppression began
+    max_supp_dd = 0.0
 
     for k in range(1, len(idxs)):
         i      = idxs[k]
@@ -194,15 +114,25 @@ def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                             and pred_ret > exit_thresh)
                 if suppress:
                     n_sup += 1
+                    if not supp_active:
+                        supp_active = True
+                        supp_peak   = peak   # capture before any trail reset
                     daily_rets.append(c_cur / c_prev - 1.0)
                     if trail_exit:
                         peak = c_cur  # reset trail from here
                 else:
                     daily_rets.append(c_cur / c_prev - 1.0)
                     in_pos = False
+                    supp_active = False
                     n_trades += 1
             else:
                 daily_rets.append(c_cur / c_prev - 1.0)
+
+            # Track worst excursion while holding through a suppressed exit.
+            if supp_active and in_pos:
+                dd = c_cur / supp_peak - 1.0
+                if dd < max_supp_dd:
+                    max_supp_dd = dd
         else:
             entry_signal = (ema_ef[i] > ema_es[i]) and (ema_ef[i_prev] <= ema_es[i_prev])
             allow_entry = True
@@ -217,7 +147,7 @@ def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                 n_blk += 1
             daily_rets.append(0.0)
 
-    return np.array(daily_rets), n_trades, n_sup, n_blk
+    return np.array(daily_rets), n_trades, n_sup, n_blk, max_supp_dd
 
 
 # ── Performance metrics ───────────────────────────────────────────────────────
@@ -248,47 +178,69 @@ VARIANTS = [
 ]
 
 
-def run_all(sym, prices_df, pred_df):
-    n_years = (len(prices_df) - 1) / 252.0
+def run_all(sym, prices_df_full, pred_df):
+    params = PARAMS[sym]
 
-    # Build prediction lookup once
+    # Shifted monthly prediction lookup (HIGH-2): a row dated month M holds
+    # month-M month-end data, so its forecast is only knowable ~M+1. Apply it to
+    # trading days in M+1 (matches the live scanner) to avoid 1-month look-ahead.
     p = pred_df.copy()
-    p["ym"] = p["Date"].dt.to_period("M")
+    p["ym"] = p["Date"].dt.to_period("M") + 1
     pred_dict = dict(zip(p["ym"], p["Predicted_Return"]))
 
-    params = PARAMS[sym]
+    # EMAs on full history so the OOS start is properly seeded (MED-5: no warm-up
+    # bias), then simulate only over the OOS span.
+    closes = prices_df_full["close"].values
+    dates  = prices_df_full["date"].values
+    ema_ef = _ema(prices_df_full["close"], params["ef"])
+    ema_es = _ema(prices_df_full["close"], params["es"])
+    ema_xf = _ema(prices_df_full["close"], params["xf"])
+    ema_xs = _ema(prices_df_full["close"], params["xs"])
+
+    oos_start = pd.Timestamp(OOS_START)
+    oos_end   = prices_df_full["date"].max()
+    oos_mask  = (prices_df_full["date"] >= oos_start) & (prices_df_full["date"] <= oos_end)
+    n_years   = (int(oos_mask.sum()) - 1) / 252.0
+
     rows = []
 
-    # BH
-    bh_rets = prices_df["bh_equity"].pct_change().fillna(0.0).values[1:]
+    # BH (OOS slice)
+    bh_rets = prices_df_full.loc[oos_mask, "bh_equity"].pct_change().fillna(0.0).values[1:]
     bh = {
         "symbol": sym, "variant": "bh", "threshold": np.nan,
         "cagr": _cagr(bh_rets, n_years),
         "sharpe": _sharpe(bh_rets),
         "max_dd": _max_dd(bh_rets),
-        "n_trades": np.nan, "n_suppressed": 0, "n_blocked": 0,
+        "n_trades": np.nan, "n_suppressed": 0, "n_blocked": 0, "max_supp_dd": np.nan,
     }
 
     # Baseline EMA (no filter)
-    br, bt, _, _ = simulate(prices_df, pred_dict, params)
+    br, bt, _, _, _ = simulate_period(
+        closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
+        pred_dict, params, oos_start, oos_end
+    )
     baseline = {
         "symbol": sym, "variant": "baseline", "threshold": np.nan,
         "cagr": _cagr(br, n_years),
         "sharpe": _sharpe(br),
         "max_dd": _max_dd(br),
-        "n_trades": bt, "n_suppressed": 0, "n_blocked": 0,
+        "n_trades": bt, "n_suppressed": 0, "n_blocked": 0, "max_supp_dd": np.nan,
     }
     rows.extend([bh, baseline])
 
     for thresh in THRESHOLDS:
         for name, kw_fn in VARIANTS:
-            rets, nt, ns, nb = simulate(prices_df, pred_dict, params, **kw_fn(thresh))
+            rets, nt, ns, nb, msdd = simulate_period(
+                closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
+                pred_dict, params, oos_start, oos_end, **kw_fn(thresh)
+            )
             rows.append({
                 "symbol": sym, "variant": name, "threshold": thresh,
                 "cagr": _cagr(rets, n_years),
                 "sharpe": _sharpe(rets),
                 "max_dd": _max_dd(rets),
                 "n_trades": nt, "n_suppressed": ns, "n_blocked": nb,
+                "max_supp_dd": msdd,
             })
 
     return rows
@@ -315,8 +267,10 @@ def run_walkforward_threshold(sym, prices_df_full, pred_df):
     """
     params = PARAMS[sym]
 
+    # Shifted monthly prediction lookup (HIGH-2): row dated M holds month-M
+    # month-end data, knowable only ~M+1, so apply it to trading days in M+1.
     p = pred_df.copy()
-    p["ym"] = p["Date"].dt.to_period("M")
+    p["ym"] = p["Date"].dt.to_period("M") + 1
     pred_dict = dict(zip(p["ym"], p["Predicted_Return"]))
 
     # Pre-compute EMAs on full history once — all period slices share these arrays.
@@ -329,6 +283,10 @@ def run_walkforward_threshold(sym, prices_df_full, pred_df):
 
     max_date = prices_df_full["date"].max()
     rows = []
+    # Concatenated OOS daily returns per series → true daily-chained MaxDD (MED-6).
+    daily_by_variant = {v: [] for v, _ in VARIANTS}
+    daily_by_variant["bh"]       = []
+    daily_by_variant["baseline"] = []
 
     for oos_year in range(2010, 2027):
         is_start  = pd.Timestamp(f"{oos_year - IS_YEARS_WF}-01-01")
@@ -344,11 +302,13 @@ def run_walkforward_threshold(sym, prices_df_full, pred_df):
         oos_bh   = prices_df_full.loc[oos_mask, "bh_equity"].pct_change().fillna(0.0).values[1:]
         bh_ret   = float(np.prod(1.0 + oos_bh) - 1.0) if len(oos_bh) else np.nan
 
-        bl_rets, bl_t, _, _ = simulate_period(
+        bl_rets, bl_t, _, _, _ = simulate_period(
             closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
             pred_dict, params, oos_start, oos_end
         )
         bl_ret = float(np.prod(1.0 + bl_rets) - 1.0) if len(bl_rets) else np.nan
+        daily_by_variant["bh"].append(oos_bh)
+        daily_by_variant["baseline"].append(bl_rets)
 
         for vname, kw_fn in VARIANTS:
             # ── IS: find threshold that maximises Sharpe ──
@@ -356,7 +316,7 @@ def run_walkforward_threshold(sym, prices_df_full, pred_df):
             best_is_sharpe = -np.inf
 
             for thresh in THRESHOLDS:
-                rets, _, _, _ = simulate_period(
+                rets, _, _, _, _ = simulate_period(
                     closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                     pred_dict, params, is_start, is_end, **kw_fn(thresh)
                 )
@@ -368,10 +328,11 @@ def run_walkforward_threshold(sym, prices_df_full, pred_df):
                     best_thresh = thresh
 
             # ── OOS: apply selected threshold ──
-            oos_rets, n_t, n_s, n_b = simulate_period(
+            oos_rets, n_t, n_s, n_b, n_msdd = simulate_period(
                 closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                 pred_dict, params, oos_start, oos_end, **kw_fn(best_thresh)
             )
+            daily_by_variant[vname].append(oos_rets)
 
             rows.append({
                 "year":      oos_year,
@@ -387,14 +348,23 @@ def run_walkforward_threshold(sym, prices_df_full, pred_df):
                 "oos_trades":  n_t,
                 "oos_suppressed": n_s,
                 "oos_blocked":    n_b,
+                "oos_max_supp_dd": n_msdd,
                 "n_oos_days":  len(oos_rets),
             })
 
-    return rows
+    # Concatenate per-variant OOS daily returns for a true daily-chained MaxDD.
+    daily_concat = {v: (np.concatenate(arrs) if arrs else np.array([]))
+                    for v, arrs in daily_by_variant.items()}
+    return rows, daily_concat
 
 
-def wf_chain_stats(rows, variant):
-    """Aggregate chain-linked stats across OOS years for one variant."""
+def wf_chain_stats(rows, variant, daily_map=None):
+    """Aggregate chain-linked stats across OOS years for one variant.
+
+    daily_map (optional): {series_name: concatenated daily-return array}. When
+    provided, MaxDD is the true daily-chained drawdown (MED-6); otherwise it
+    falls back to the coarse annual-resolution drawdown.
+    """
     v = sorted([r for r in rows if r["variant"] == variant], key=lambda r: r["year"])
     if not v:
         return {}
@@ -404,12 +374,25 @@ def wf_chain_stats(rows, variant):
     n_years = sum(r["n_oos_days"] for r in v) / 252.0
     def _c(eq): return float(eq[-1] ** (1.0 / n_years) - 1.0)
     strat_eq = np.cumprod(1.0 + strat)
+
+    if daily_map is not None:
+        strat_dd = _max_dd(daily_map[variant]) if len(daily_map.get(variant, [])) else np.nan
+        bh_dd    = _max_dd(daily_map["bh"])    if len(daily_map.get("bh", []))   else np.nan
+    else:
+        strat_dd = _max_dd_annual(strat)
+        bh_dd    = _max_dd_annual(bh)
+
+    # Worst drawdown endured while holding through a suppressed exit (HIGH-3).
+    supp = [r["oos_max_supp_dd"] for r in v if r.get("oos_max_supp_dd", 0.0) < 0.0]
+    worst_supp_dd = float(min(supp)) if supp else 0.0
+
     return {
         "strat_cagr":   _c(strat_eq),
         "bh_cagr":      _c(np.cumprod(1.0 + bh)),
         "bl_cagr":      _c(np.cumprod(1.0 + bl)),
-        "max_dd":       _max_dd_annual(strat),
-        "bh_max_dd":    _max_dd_annual(bh),
+        "max_dd":       strat_dd,
+        "bh_max_dd":    bh_dd,
+        "worst_supp_dd": worst_supp_dd,
         "hit_rate":     float(np.mean(strat > 0)),
         "avg_thresh":   float(np.mean([r["is_thresh"] for r in v])),
         "avg_oos_sharpe": float(np.nanmean([r["oos_sharpe"] for r in v])),
@@ -453,7 +436,9 @@ def write_markdown(all_rows, out_path):
         "- QQQ: entry EMA(12/24), exit EMA(10/23), 5% trailing stop",
         "",
         "**ML filter:** `Predicted_Return` (%) from SP500/NDX MODERATE walk-forward regressor. "
-        "Prediction for month M is applied to all days in M (no look-ahead bias).",
+        "Each row is month-end data; its forecast is shifted +1 month so the month-M "
+        "forecast is applied to trading days in M+1 (knowable only after month-M close — "
+        "no look-ahead bias).",
         "",
         "**Rule variants:**",
         "1. **Exit filter** — suppress EMA/trail exit if ML pred > threshold",
@@ -508,16 +493,16 @@ def write_markdown(all_rows, out_path):
             lines += [
                 f"### {sym} — {label} Sweep",
                 "",
-                f"| Threshold | CAGR | Sharpe | MaxDD | #Trades | {vextra} |",
-                "|---|---|---|---|---|---|",
+                f"| Threshold | CAGR | Sharpe | MaxDD | Supp MaxDD | #Trades | {vextra} |",
+                "|---|---|---|---|---|---|---|",
                 (f"| Baseline | {pct(bl_row['cagr'])} | {bl_row['sharpe']:+.2f} | "
-                 f"{pct(bl_row['max_dd'])} | {int(bl_row['n_trades'])} | 0 |"),
+                 f"{pct(bl_row['max_dd'])} | n/a | {int(bl_row['n_trades'])} | 0 |"),
             ]
             for _, r in v_sub.iterrows():
                 extra_val = int(r[vcol])
                 lines.append(
                     f"| {r['threshold']:+.1f}% | {pct(r['cagr'])} | {r['sharpe']:+.2f} | "
-                    f"{pct(r['max_dd'])} | {int(r['n_trades'])} | {extra_val} |"
+                    f"{pct(r['max_dd'])} | {pct(r['max_supp_dd'])} | {int(r['n_trades'])} | {extra_val} |"
                 )
             lines.append("")
 
@@ -547,7 +532,7 @@ def write_markdown(all_rows, out_path):
     print(f"Markdown written → {out_path}")
 
 
-def write_wf_markdown(all_wf_rows, out_path):
+def write_wf_markdown(all_wf_rows, daily_maps, out_path):
     df = pd.DataFrame(all_wf_rows)
     lines = [
         "# EMA + ML Compound Filter — Walk-Forward Threshold Validation",
@@ -577,7 +562,7 @@ def write_wf_markdown(all_wf_rows, out_path):
             "| Metric | BH | EMA Baseline | WF Exit Filter | WF Entry Gate | WF Combined |",
             "|---|---|---|---|---|---|",
         ]
-        stats = {v: wf_chain_stats(sub_rows, v) for v, _ in VARIANTS}
+        stats = {v: wf_chain_stats(sub_rows, v, daily_maps[sym]) for v, _ in VARIANTS}
         s0 = next(iter(stats.values()))  # BH/baseline same across variants
         lines += [
             (f"| Chain CAGR | {pct(s0['bh_cagr'])} | {pct(s0['bl_cagr'])} | "
@@ -588,11 +573,15 @@ def write_wf_markdown(all_wf_rows, out_path):
              f"{stats['exit_filter']['avg_oos_sharpe']:+.2f} | "
              f"{stats['entry_gate']['avg_oos_sharpe']:+.2f} | "
              f"{stats['combined']['avg_oos_sharpe']:+.2f} |"),
-            (f"| Chain MaxDD | {pct(s0['bh_max_dd'])} | — | "
+            (f"| Chain MaxDD (daily) | {pct(s0['bh_max_dd'])} | — | "
              f"{pct(stats['exit_filter']['max_dd'])} | "
              f"{pct(stats['entry_gate']['max_dd'])} | "
              f"{pct(stats['combined']['max_dd'])} |"),
-            (f"| Hit rate (yr>0) | — | {pct(s0['hit_rate'])} | "
+            (f"| Worst Supp DD | — | — | "
+             f"{pct(stats['exit_filter']['worst_supp_dd'])} | "
+             f"{pct(stats['entry_gate']['worst_supp_dd'])} | "
+             f"{pct(stats['combined']['worst_supp_dd'])} |"),
+            (f"| Hit rate (yr>0) | — | — | "
              f"{pct(stats['exit_filter']['hit_rate'])} | "
              f"{pct(stats['entry_gate']['hit_rate'])} | "
              f"{pct(stats['combined']['hit_rate'])} |"),
@@ -611,14 +600,14 @@ def write_wf_markdown(all_wf_rows, out_path):
             lines += [
                 f"### {sym} — {label} (Year-by-Year)",
                 "",
-                "| Year | IS Thresh | IS Sharpe | OOS Strat | OOS BH | OOS Baseline | OOS Sharpe | OOS MaxDD |",
-                "|---|---|---|---|---|---|---|---|",
+                "| Year | IS Thresh | IS Sharpe | OOS Strat | OOS BH | OOS Baseline | OOS Sharpe | OOS MaxDD | Supp MaxDD |",
+                "|---|---|---|---|---|---|---|---|---|",
             ]
             for r in v_rows:
                 lines.append(
                     f"| {r['year']} | {r['is_thresh']:+.1f}% | {r['is_sharpe']:+.2f} | "
                     f"{pct(r['oos_ret'])} | {pct(r['oos_bh_ret'])} | {pct(r['oos_bl_ret'])} | "
-                    f"{r['oos_sharpe']:+.2f} | {pct(r['oos_max_dd'])} |"
+                    f"{r['oos_sharpe']:+.2f} | {pct(r['oos_max_dd'])} | {pct(r['oos_max_supp_dd'])} |"
                 )
             lines.append("")
 
@@ -650,21 +639,19 @@ def write_wf_markdown(all_wf_rows, out_path):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    all_rows    = []
-    all_wf_rows = []
+    all_rows     = []
+    all_wf_rows  = []
+    all_wf_daily = {}   # {sym: {series_name: daily-return array}} for daily MaxDD
 
     for sym in ["SPY", "QQQ"]:
         print(f"\n{'='*55}\n{sym}")
-        prices_df      = load_prices(sym)
         prices_df_full = load_prices_full(sym)
         pred_df        = load_ml_predictions(sym)
-        print(f"  Prices (OOS): {len(prices_df)} rows, "
-              f"{prices_df['date'].iloc[0].date()} → {prices_df['date'].iloc[-1].date()}")
         print(f"  Prices (full): {len(prices_df_full)} rows, "
               f"{prices_df_full['date'].iloc[0].date()} → {prices_df_full['date'].iloc[-1].date()}")
 
         # ── In-sample threshold sweep (existing analysis) ──
-        rows = run_all(sym, prices_df, pred_df)
+        rows = run_all(sym, prices_df_full, pred_df)
         all_rows.extend(rows)
 
         sub = pd.DataFrame(rows)
@@ -681,16 +668,17 @@ def main():
 
         # ── Walk-forward threshold validation ──
         print(f"\n  Running walk-forward threshold validation ({IS_YEARS_WF}yr IS, 17 OOS years)…")
-        wf_rows = run_walkforward_threshold(sym, prices_df_full, pred_df)
+        wf_rows, wf_daily = run_walkforward_threshold(sym, prices_df_full, pred_df)
         all_wf_rows.extend(wf_rows)
+        all_wf_daily[sym] = wf_daily
 
         for vname, _ in VARIANTS:
-            st = wf_chain_stats(wf_rows, vname)
+            st = wf_chain_stats(wf_rows, vname, wf_daily)
             label = vname.replace("_", " ").title()
             print(f"  WF {label}: chain CAGR={pct(st['strat_cagr'])}, "
                   f"avg Sharpe={st['avg_oos_sharpe']:+.2f}, "
-                  f"MaxDD={pct(st['max_dd'])}, hit={pct(st['hit_rate'],0)}, "
-                  f"avg thresh={st['avg_thresh']:+.1f}%")
+                  f"MaxDD={pct(st['max_dd'])}, worst supp DD={pct(st['worst_supp_dd'])}, "
+                  f"hit={pct(st['hit_rate'],0)}, avg thresh={st['avg_thresh']:+.1f}%")
 
     # ── Write outputs ──
     csv_path = RESULTS / f"ema_ml_filter_{TODAY_STR}.csv"
@@ -703,7 +691,7 @@ def main():
     pd.DataFrame(all_wf_rows).to_csv(wf_csv, index=False)
     print(f"WF results CSV → {wf_csv}")
 
-    write_wf_markdown(all_wf_rows, RESULTS / f"ema_ml_wf_threshold_{TODAY_STR}.md")
+    write_wf_markdown(all_wf_rows, all_wf_daily, RESULTS / f"ema_ml_wf_threshold_{TODAY_STR}.md")
 
 
 if __name__ == "__main__":

@@ -204,6 +204,42 @@ Fetches 2 years of history via yfinance, reconstructs current open trade for eac
 
 No launchd wrapper needed — user runs manually after close.
 
+### ML exit filter (exit-only) — added 2026-06-06
+
+Layers the SP500/NDX **MODERATE** monthly regressor onto the EMA rule as an
+**exit filter only**: when an EMA-cross or trailing-stop exit fires, it is
+**suppressed if the model's forecast > `ML_THRESHOLD`** (hardcoded `0.0%` for
+both tickers). **Entries are never gated** — positions always open on a plain
+EMA entry crossover. The entry-gate and combined variants were tested
+(`backtest_ema_ml_filter.py`) and **not promoted**: the entry gate only matches
+baseline CAGR, while the exit filter recovers most of buy-and-hold's return.
+
+- **Forecast alignment:** each MODERATE row is **month-end** data forecasting
+  M+1…M+3, so it is applied to trading days in **M+1** (+1-month shift — no
+  look-ahead). The scanner and backtest use the same shift.
+- **Scanner (`ema_spy_qqq_scan.py`):** reconstructs the open trade through the
+  *prior* bar replaying the filter, then evaluates today's bar live. (Fixed a
+  prior bug where the loop consumed today's exit and never showed `SELL`.)
+- **Backtest (`backtest_ema_ml_filter.py`):** IS threshold sweep + nested
+  walk-forward threshold selection (9yr IS, OOS 2010–2026, 5 bps TC). Outputs
+  `results/ema_ml_filter_*.{csv,md}` and `ema_ml_wf_threshold_*.{csv,md}`.
+
+**Walk-forward OOS results (exit filter vs buy-and-hold, 2010 → May 2026):**
+
+| Ticker | BH CAGR | EMA base CAGR | **Exit filter CAGR** | Exit Sharpe | Exit MaxDD | BH MaxDD |
+|---|---|---|---|---|---|---|
+| SPY | +14.0% | +5.5% | **+13.1%** | +1.26 | -19.4% | -33.7% |
+| QQQ | +19.0% | +10.9% | **+15.8%** | +1.37 | -22.8% | -35.7% |
+
+- Exit filter recovers ~83–93% of BH CAGR while ~halving drawdown and lifting
+  Sharpe from ~0.9 to ~1.3. SPY positive in 15/17 OOS years.
+- **Caveat — concentrated tail:** the "Worst Supp DD" (drawdown endured while
+  holding through a suppressed exit) is **−18.8% (SPY combined) / −16.9% (QQQ)**,
+  i.e. nearly the entire strategy drawdown occurs in the months the model is
+  wrong. The Sharpe edge buys return by accepting that tail.
+- The +1-month look-ahead fix barely moved results (SPY ~+13.3%→+13.1%) because
+  the 3-month forecast is highly autocorrelated month-to-month.
+
 ### Annual walk-forward parameter validation (updated 2026-06-03)
 
 Script: `walkforward_ema_optimization.py` — outputs to `results/`.
