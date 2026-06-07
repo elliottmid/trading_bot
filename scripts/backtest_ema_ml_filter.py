@@ -26,6 +26,8 @@ PARAMS = {
     "QQQ": {"ef": 12, "es": 24, "xf": 10, "xs": 23, "trail": 0.05},
 }
 
+INVERSE_DRAG_BPD = 0.5e-4   # 0.5 bps/day inverse-ETF drag (~1.25%/yr; models SH/PSQ)
+
 ML_PATTERN = {
     "SPY": "sp500_moderate_results_*.csv",
     "QQQ": "ndx_moderate_results_*.csv",
@@ -67,7 +69,7 @@ def _ema(series, span):
 
 def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                     pred_dict, params, period_start, period_end,
-                    exit_thresh=None, entry_thresh=None):
+                    exit_thresh=None, entry_thresh=None, long_short=False):
     """
     Simulate for a specific date range using pre-computed global EMA arrays.
     Position state starts fresh (in_pos=False) at period_start — same convention
@@ -86,8 +88,9 @@ def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
     if len(idxs) < 2:
         return np.array([]), 0, 0, 0, 0.0
 
-    in_pos = False
-    peak   = 0.0
+    in_pos   = False
+    in_short = False       # long/short mode: currently holding short
+    peak     = 0.0
     daily_rets = []
     n_trades = n_sup = n_blk = 0
     supp_active = False    # currently holding past a suppressed exit
@@ -125,6 +128,8 @@ def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                     in_pos = False
                     supp_active = False
                     n_trades += 1
+                    if long_short:
+                        in_short = True   # stay invested — flip to short
             else:
                 daily_rets.append(c_cur / c_prev - 1.0)
 
@@ -135,17 +140,31 @@ def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                     max_supp_dd = dd
         else:
             entry_signal = (ema_ef[i] > ema_es[i]) and (ema_ef[i_prev] <= ema_es[i_prev])
-            allow_entry = True
-            if entry_thresh is not None and pred_ret is not None:
-                allow_entry = pred_ret > entry_thresh
 
-            if entry_signal and allow_entry:
-                in_pos = True
-                peak = c_cur
-                n_trades += 1
-            elif entry_signal and not allow_entry:
-                n_blk += 1
-            daily_rets.append(0.0)
+            if in_short:
+                # Earn inverse return minus daily drag until entry EMA fires.
+                short_ret = -(c_cur / c_prev - 1.0) - INVERSE_DRAG_BPD
+                if entry_signal:
+                    # Exit short, enter long at today's close.
+                    daily_rets.append(short_ret)
+                    in_short = False
+                    in_pos   = True
+                    peak     = c_cur
+                    n_trades += 1
+                else:
+                    daily_rets.append(short_ret)
+            else:
+                allow_entry = True
+                if entry_thresh is not None and pred_ret is not None:
+                    allow_entry = pred_ret > entry_thresh
+
+                if entry_signal and allow_entry:
+                    in_pos = True
+                    peak = c_cur
+                    n_trades += 1
+                elif entry_signal and not allow_entry:
+                    n_blk += 1
+                daily_rets.append(0.0)
 
     return np.array(daily_rets), n_trades, n_sup, n_blk, max_supp_dd
 
@@ -175,6 +194,7 @@ VARIANTS = [
     ("exit_filter", lambda t: {"exit_thresh": t}),
     ("entry_gate",  lambda t: {"entry_thresh": t}),
     ("combined",    lambda t: {"exit_thresh": t, "entry_thresh": t}),
+    ("ls_filter",   lambda t: {"exit_thresh": t, "long_short": True}),
 ]
 
 
@@ -457,6 +477,7 @@ def write_markdown(all_rows, out_path):
         bef = _best(sub, "exit_filter")
         beg = _best(sub, "entry_gate")
         bco = _best(sub, "combined")
+        bls = _best(sub, "ls_filter")
 
         def _f(r, col):
             if r is None: return "n/a"
@@ -468,17 +489,19 @@ def write_markdown(all_rows, out_path):
         lines += [
             f"## {sym}",
             "",
-            f"| Metric | BH | EMA Baseline | Best Exit Filter | Best Entry Gate | Best Combined |",
-            f"|---|---|---|---|---|---|",
+            f"| Metric | BH | EMA Baseline | Best Exit Filter | Best Entry Gate | Best Combined | Best L/S Filter |",
+            f"|---|---|---|---|---|---|---|",
             (f"| CAGR | {pct(bh_row['cagr'])} | {pct(bl_row['cagr'])} | "
-             f"{_f(bef,'cagr')} | {_f(beg,'cagr')} | {_f(bco,'cagr')} |"),
+             f"{_f(bef,'cagr')} | {_f(beg,'cagr')} | {_f(bco,'cagr')} | {_f(bls,'cagr')} |"),
             (f"| Sharpe | {bh_row['sharpe']:+.2f} | {bl_row['sharpe']:+.2f} | "
-             f"{_f(bef,'sharpe')} | {_f(beg,'sharpe')} | {_f(bco,'sharpe')} |"),
+             f"{_f(bef,'sharpe')} | {_f(beg,'sharpe')} | {_f(bco,'sharpe')} | {_f(bls,'sharpe')} |"),
             (f"| MaxDD | {pct(bh_row['max_dd'])} | {pct(bl_row['max_dd'])} | "
-             f"{_f(bef,'max_dd')} | {_f(beg,'max_dd')} | {_f(bco,'max_dd')} |"),
+             f"{_f(bef,'max_dd')} | {_f(beg,'max_dd')} | {_f(bco,'max_dd')} | {_f(bls,'max_dd')} |"),
             (f"| Best threshold | — | — | "
-             f"{bef['threshold']:+.1f}% | {beg['threshold']:+.1f}% | {bco['threshold']:+.1f}% |"
-             if (bef is not None and beg is not None and bco is not None) else "| Best threshold | — | — | n/a | n/a | n/a |"),
+             f"{bef['threshold']:+.1f}% | {beg['threshold']:+.1f}% | "
+             f"{bco['threshold']:+.1f}% | {bls['threshold']:+.1f}% |"
+             if (bef is not None and beg is not None and bco is not None and bls is not None)
+             else "| Best threshold | — | — | n/a | n/a | n/a | n/a |"),
             "",
         ]
 
@@ -487,6 +510,7 @@ def write_markdown(all_rows, out_path):
             ("exit_filter", "n_suppressed", "#Suppressed"),
             ("entry_gate",  "n_blocked",    "#Blocked"),
             ("combined",    "n_suppressed", "#Suppressed"),
+            ("ls_filter",   "n_suppressed", "#Suppressed"),
         ]:
             v_sub = sub[sub["variant"] == vname].sort_values("threshold")
             label = vname.replace("_", " ").title()
@@ -526,6 +550,11 @@ def write_markdown(all_rows, out_path):
         "",
         "5. **Entry gate without prediction**: if no prediction is available for a month, "
         "   the entry gate is bypassed (entry allowed). Exit filter is also bypassed.",
+        "",
+        "6. **L/S filter**: short positions earn `-(SPY/QQQ daily return) − 0.5 bps/day`. "
+        "   The drag (~1.25%/yr) models SH/PSQ expense ratio + volatility decay friction. "
+        "   Short is held from exit close until the next entry EMA crossover. "
+        "   ML exit suppression still applies: suppressed exits stay long, never flip to short.",
     ]
 
     out_path.write_text("\n".join(lines))
@@ -559,8 +588,8 @@ def write_wf_markdown(all_wf_rows, daily_maps, out_path):
 
         # Aggregate comparison table
         lines += [
-            "| Metric | BH | EMA Baseline | WF Exit Filter | WF Entry Gate | WF Combined |",
-            "|---|---|---|---|---|---|",
+            "| Metric | BH | EMA Baseline | WF Exit Filter | WF Entry Gate | WF Combined | WF L/S Filter |",
+            "|---|---|---|---|---|---|---|",
         ]
         stats = {v: wf_chain_stats(sub_rows, v, daily_maps[sym]) for v, _ in VARIANTS}
         s0 = next(iter(stats.values()))  # BH/baseline same across variants
@@ -568,27 +597,33 @@ def write_wf_markdown(all_wf_rows, daily_maps, out_path):
             (f"| Chain CAGR | {pct(s0['bh_cagr'])} | {pct(s0['bl_cagr'])} | "
              f"{pct(stats['exit_filter']['strat_cagr'])} | "
              f"{pct(stats['entry_gate']['strat_cagr'])} | "
-             f"{pct(stats['combined']['strat_cagr'])} |"),
+             f"{pct(stats['combined']['strat_cagr'])} | "
+             f"{pct(stats['ls_filter']['strat_cagr'])} |"),
             (f"| Avg OOS Sharpe | — | — | "
              f"{stats['exit_filter']['avg_oos_sharpe']:+.2f} | "
              f"{stats['entry_gate']['avg_oos_sharpe']:+.2f} | "
-             f"{stats['combined']['avg_oos_sharpe']:+.2f} |"),
+             f"{stats['combined']['avg_oos_sharpe']:+.2f} | "
+             f"{stats['ls_filter']['avg_oos_sharpe']:+.2f} |"),
             (f"| Chain MaxDD (daily) | {pct(s0['bh_max_dd'])} | — | "
              f"{pct(stats['exit_filter']['max_dd'])} | "
              f"{pct(stats['entry_gate']['max_dd'])} | "
-             f"{pct(stats['combined']['max_dd'])} |"),
+             f"{pct(stats['combined']['max_dd'])} | "
+             f"{pct(stats['ls_filter']['max_dd'])} |"),
             (f"| Worst Supp DD | — | — | "
              f"{pct(stats['exit_filter']['worst_supp_dd'])} | "
              f"{pct(stats['entry_gate']['worst_supp_dd'])} | "
-             f"{pct(stats['combined']['worst_supp_dd'])} |"),
+             f"{pct(stats['combined']['worst_supp_dd'])} | "
+             f"{pct(stats['ls_filter']['worst_supp_dd'])} |"),
             (f"| Hit rate (yr>0) | — | — | "
              f"{pct(stats['exit_filter']['hit_rate'])} | "
              f"{pct(stats['entry_gate']['hit_rate'])} | "
-             f"{pct(stats['combined']['hit_rate'])} |"),
+             f"{pct(stats['combined']['hit_rate'])} | "
+             f"{pct(stats['ls_filter']['hit_rate'])} |"),
             (f"| Avg IS threshold | — | — | "
              f"{stats['exit_filter']['avg_thresh']:+.1f}% | "
              f"{stats['entry_gate']['avg_thresh']:+.1f}% | "
-             f"{stats['combined']['avg_thresh']:+.1f}% |"),
+             f"{stats['combined']['avg_thresh']:+.1f}% | "
+             f"{stats['ls_filter']['avg_thresh']:+.1f}% |"),
             "",
         ]
 
@@ -659,7 +694,7 @@ def main():
         bl  = sub[sub["variant"] == "baseline"].iloc[0]
         print(f"  BH:       CAGR={pct(bh['cagr'])}, Sharpe={bh['sharpe']:+.2f}, MaxDD={pct(bh['max_dd'])}")
         print(f"  Baseline: CAGR={pct(bl['cagr'])}, Sharpe={bl['sharpe']:+.2f}, MaxDD={pct(bl['max_dd'])}")
-        for vname in ("exit_filter", "entry_gate", "combined"):
+        for vname in ("exit_filter", "entry_gate", "combined", "ls_filter"):
             best = _best(sub, vname)
             if best is not None:
                 print(f"  Best {vname}: threshold={best['threshold']:+.1f}%, "
