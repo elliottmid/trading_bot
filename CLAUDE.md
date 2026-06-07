@@ -210,9 +210,8 @@ Layers the SP500/NDX **MODERATE** monthly regressor onto the EMA rule as an
 **exit filter only**: when an EMA-cross or trailing-stop exit fires, it is
 **suppressed if the model's forecast > `ML_THRESHOLD`** (hardcoded `0.0%` for
 both tickers). **Entries are never gated** — positions always open on a plain
-EMA entry crossover. The entry-gate and combined variants were tested
-(`backtest_ema_ml_filter.py`) and **not promoted**: the entry gate only matches
-baseline CAGR, while the exit filter recovers most of buy-and-hold's return.
+EMA entry crossover. Four compound variants were tested in `backtest_ema_ml_filter.py`;
+only the exit filter was promoted.
 
 - **Forecast alignment:** each MODERATE row is **month-end** data forecasting
   M+1…M+3, so it is applied to trading days in **M+1** (+1-month shift — no
@@ -222,21 +221,40 @@ baseline CAGR, while the exit filter recovers most of buy-and-hold's return.
   prior bug where the loop consumed today's exit and never showed `SELL`.)
 - **Backtest (`backtest_ema_ml_filter.py`):** IS threshold sweep + nested
   walk-forward threshold selection (9yr IS, OOS 2010–2026, 5 bps TC). Outputs
-  `results/ema_ml_filter_*.{csv,md}` and `ema_ml_wf_threshold_*.{csv,md}`.
+  `results/ema_ml_filter_*.{csv,md}`, `ema_ml_wf_threshold_*.{csv,md}`, and
+  `ema_ml_filter_executive_summary_*.md`.
 
-**Walk-forward OOS results (exit filter vs buy-and-hold, 2010 → May 2026):**
+**Walk-forward OOS results (all variants, 2010 → May 2026):**
 
-| Ticker | BH CAGR | EMA base CAGR | **Exit filter CAGR** | Exit Sharpe | Exit MaxDD | BH MaxDD |
+| Ticker | BH | EMA base | Exit filter | Entry gate | Combined | L/S filter |
 |---|---|---|---|---|---|---|
-| SPY | +14.0% | +5.5% | **+13.1%** | +1.26 | -19.4% | -33.7% |
-| QQQ | +19.0% | +10.9% | **+15.8%** | +1.37 | -22.8% | -35.7% |
+| SPY CAGR | +14.2% | +6.9% | **+13.1%** | +5.0% | +10.3% | +13.0% |
+| SPY Sharpe | +0.86 | +0.80 | **+1.26** | +1.12 | +1.43 | +1.17 |
+| SPY MaxDD | -33.7% | -14.9% | -19.4% | **-11.8%** | -21.5% | -25.7% |
+| SPY hit rate | — | — | **88%** | 59% | 76% | 76% |
+| QQQ CAGR | +19.3% | +12.9% | **+15.8%** | +10.7% | +14.1% | +17.6% |
+| QQQ Sharpe | +0.96 | +1.05 | **+1.37** | +1.12 | +1.25 | +1.36 |
+| QQQ MaxDD | -35.1% | -17.5% | -22.8% | **-10.8%** | -22.8% | -22.8% |
+| QQQ hit rate | — | — | 76% | 71% | 71% | **82%** |
 
-- Exit filter recovers ~83–93% of BH CAGR while ~halving drawdown and lifting
-  Sharpe from ~0.9 to ~1.3. SPY positive in 15/17 OOS years.
-- **Caveat — concentrated tail:** the "Worst Supp DD" (drawdown endured while
-  holding through a suppressed exit) is **−18.8% (SPY combined) / −16.9% (QQQ)**,
-  i.e. nearly the entire strategy drawdown occurs in the months the model is
-  wrong. The Sharpe edge buys return by accepting that tail.
+**Variant verdicts:**
+- **Exit filter — promoted (production rule).** Recovers ~83–92% of BH CAGR,
+  halves drawdown, lifts Sharpe from ~0.9 to ~1.3. Avg IS-optimal threshold is
+  near 0.0% for both symbols, validating the hardcoded `0.0%` in the scanner.
+- **Entry gate — not promoted.** Barely matches baseline CAGR; avg IS-optimal
+  threshold of +2–4% means the optimizer is trying to stay flat most of the time.
+- **Combined — not promoted.** Marginally better Sharpe than exit filter alone
+  (+1.43 SPY) but at a -2.8pp CAGR cost. Entry gate is the drag.
+- **L/S filter — not promoted.** Flips to short (inverse ETF, 0.5 bps/day drag
+  ≈ 1.25%/yr) when an un-suppressed exit fires; covers on next EMA entry cross.
+  SPY: strictly worse on all dimensions (same CAGR as exit filter, Sharpe drops
+  to +1.17, MaxDD deepens to -25.7%) — prior SH overlay rejection confirmed under
+  the ML-filter regime. QQQ: marginal CAGR pickup (+17.6% vs +15.8%, Sharpe
+  essentially identical, same MaxDD), but edge is thin and tail-exposed; one
+  short-into-a-rip year erases it. Not worth the added complexity.
+- **Caveat — concentrated tail:** worst suppressed-hold drawdown is **-13.0%
+  (SPY) / -16.9% (QQQ)** — nearly the entire strategy drawdown occurs in months
+  the model is wrong. The Sharpe edge buys return by accepting that tail.
 - The +1-month look-ahead fix barely moved results (SPY ~+13.3%→+13.1%) because
   the 3-month forecast is highly autocorrelated month-to-month.
 
