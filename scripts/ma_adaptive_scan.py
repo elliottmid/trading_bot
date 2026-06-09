@@ -542,6 +542,8 @@ def print_scan(results: list[dict]) -> None:
         elif sig == "SELL":
             print(f"   ── ACTION ───────────────────────────────────")
             print(f"   Exit at tomorrow's open")
+            print(f"   Trigger : {'trailing stop' if r['exit_reason'] == 'trail' else mt_ + ' cross-down'}"
+                  f"  (stop ${r['trail_stop']:.2f})")
             print(f"   Entry was : ${r['entry_price']:.2f}  on  {r['entry_date']}")
             print(f"   Unrealised P&L at today's close : {r['unrealised']:+.2%}")
             if r["ml_filter_on"] and r["ml_pred"] is not None:
