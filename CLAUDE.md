@@ -293,6 +293,24 @@ Script: `walkforward_ema_optimization.py` — outputs to `results/`.
 - **Scanner parameters should not be updated to walk-forward winners.** The scanner's Sharpe-optimized params (EMA 12/16 entry, 8/10 exit, 6% trail for SPY; 12/24 entry, 10/23 exit, 5% trail for QQQ) were selected on the full 2000–2019 IS window — a longer, more stable base than any 9-year rolling window.
 - **Worst years: 2011, 2018, 2022** (volatile declining markets). Best years: 2020 QQQ +33.6%, 2019 SPY +16.4%, 2025 QQQ +19.6%, 2024 SPY +15.0%.
 
+**Faster-entry grid — tested and rejected (2026-06-09).** Hypothesis: dropping the
+entry-EMA floor to admit faster crossovers (`ef≥1, es≥4` → 231 entry pairs /
+161,700 combos, a superset of the default 175-pair grid) would get into trends
+sooner. A head-to-head walk-forward (same data/code, default vs `--fast-entry`)
+showed it **does not help — flat-to-worse on every metric**:
+
+| | Default (ef≥3) | Fast-entry (ef≥1) |
+|---|---|---|
+| SPY CAGR / Sharpe / MaxDD / hit | +4.2% / 0.91 / −8.1% / 76% | +3.9% / 0.88 / −8.3% / 71% |
+| QQQ CAGR / Sharpe / MaxDD / hit | +5.6% / 0.97 / −9.1% / 65% | +5.6% / 0.85 / −11.2% / 65% |
+
+SPY loses CAGR/Sharpe/hit-rate; QQQ holds CAGR but Sharpe drops 0.97→0.85 and
+MaxDD deepens ~2pp. Classic superset overfit — the wider grid can only raise *IS*
+Sharpe, and that extra freedom buys whipsaw OOS. **Keep the `ef≥3/es≥8` floor.**
+The `--fast-entry` change was reverted from `walkforward_ema_optimization.py`
+(never committed). The same idea on the weekly-filter variant
+(`walkforward_weekly_ema_filter.py`) was abandoned before completion.
+
 ### IS lookback sweep (2026-06-02)
 
 Script: `walkforward_lookback_sweep.py` — sweeps IS window from 60 to 180 months (step 12) for both SPY and QQQ, running the full 2010–2026 annual walk-forward at each window length. Output: `results/ema_lookback_sweep_YYYY-MM-DD.{csv,md,png}`.
