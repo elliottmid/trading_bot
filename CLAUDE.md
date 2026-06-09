@@ -42,7 +42,7 @@ Paths are relative to repo root.
 | `walkforward_ema_optimization.py` | Annual walk-forward: finds Sharpe-maximizing EMA entry/exit + trailing stop (3–6%) on prior 9-year IS window (108-month optimum), applies to next calendar year OOS. 122,500 combos, joblib parallel. Outputs CSV + equity curve chart to `results/`. |
 | `walkforward_sma_optimization.py` | Same as EMA version but for SMA. Prior 14-year IS window (168-month lookback-sweep optimum). 122,500 combos, joblib parallel. Outputs CSV + equity curve chart to `results/`. |
 | `walkforward_lookback_sweep.py` | Outer loop over IS window length (60–180m, step 12) for both SPY and QQQ. Supports `--ma-type ema\|sma`. EMA: identifies 108m optimum. SMA: identifies 168m optimum. Outputs CSV + markdown report + 4-panel chart to `results/`. |
-| `ma_adaptive_scan.py` | Adaptive daily scanner — runs IS grid search on past 9 years (cached 30d), reports today's signal for SPY and QQQ. Supports EMA/SMA/Wilder MA types via `--ma-type`. |
+| `ma_adaptive_scan.py` | Adaptive daily scanner — runs IS grid search on past 9 years (cached 30d), reports today's signal for SPY and QQQ. Supports EMA/SMA/Wilder MA types via `--ma-type`. Carries the same exit-only ML filter as `ema_spy_qqq_scan.py` (suppresses exits when the MODERATE forecast > `ML_THRESHOLD`: SPY +0.5%, QQQ 0.0%; entries never gated). `--no-ml-filter` shows raw signals. |
 
 ## Credentials
 
@@ -208,8 +208,9 @@ No launchd wrapper needed — user runs manually after close.
 
 Layers the SP500/NDX **MODERATE** monthly regressor onto the EMA rule as an
 **exit filter only**: when an EMA-cross or trailing-stop exit fires, it is
-**suppressed if the model's forecast > `ML_THRESHOLD`** (hardcoded `0.0%` for
-both tickers). **Entries are never gated** — positions always open on a plain
+**suppressed if the model's forecast > `ML_THRESHOLD`** (`SPY +0.5%`, `QQQ 0.0%`
+— SPY raised 2026-06-09; see "SPY hurdle raised" note below). **Entries are never
+gated** — positions always open on a plain
 EMA entry crossover. Four compound variants were tested in `backtest_ema_ml_filter.py`;
 only the exit filter was promoted.
 
@@ -219,6 +220,10 @@ only the exit filter was promoted.
 - **Scanner (`ema_spy_qqq_scan.py`):** reconstructs the open trade through the
   *prior* bar replaying the filter, then evaluates today's bar live. (Fixed a
   prior bug where the loop consumed today's exit and never showed `SELL`.)
+- **Adaptive scanner (`ma_adaptive_scan.py`, added 2026-06-09):** carries the
+  identical exit-only filter (same loader, +1-month shift, per-symbol
+  `ML_THRESHOLD`, trail-anchor reset on suppressed stop). Difference: it grid-searches its own MA params
+  each run rather than using fixed 2000–2019 params, and supports EMA/SMA/Wilder.
 - **Backtest (`backtest_ema_ml_filter.py`):** IS threshold sweep + nested
   walk-forward threshold selection (9yr IS, OOS 2010–2026, 5 bps TC). Outputs
   `results/ema_ml_filter_*.{csv,md}`, `ema_ml_wf_threshold_*.{csv,md}`, and
@@ -240,7 +245,16 @@ only the exit filter was promoted.
 **Variant verdicts:**
 - **Exit filter — promoted (production rule).** Recovers ~83–92% of BH CAGR,
   halves drawdown, lifts Sharpe from ~0.9 to ~1.3. Avg IS-optimal threshold is
-  near 0.0% for both symbols, validating the hardcoded `0.0%` in the scanner.
+  near 0.0% for both symbols.
+- **SPY hurdle raised to +0.5% (2026-06-09).** The regressor calibration line
+  (`SP500_MODERATE_*.md`) crosses zero *actual* return at ≈ +0.5% *predicted*
+  (N-weighted fit `Act = −0.51 + 0.67·Pred`, R²=0.88 — i.e. a +0.5% positive
+  bias at Pred=0). A fixed-hurdle sweep (`scripts/ml_hurdle_exposure_check.py`,
+  full-OOS 2010+) showed +0.5% vs 0.0% is **performance-neutral**: SPY CAGR
+  17.6%→17.1%, Sharpe 1.34 unchanged, **MaxDD −19.3%→−16.9%**, hit-rate 88%
+  unchanged; QQQ a wash on every metric, so QQQ stays 0.0%. `ML_THRESHOLD` is now
+  `{"SPY": 0.5, "QQQ": 0.0}` in both scanners. (Sweep levels are in-sample/
+  optimistic; the 0.0-vs-0.5 *delta* is apples-to-apples.)
 - **Entry gate — not promoted.** Barely matches baseline CAGR; avg IS-optimal
   threshold of +2–4% means the optimizer is trying to stay flat most of the time.
 - **Combined — not promoted.** Marginally better Sharpe than exit filter alone

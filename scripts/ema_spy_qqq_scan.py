@@ -13,9 +13,9 @@ deliberately not promoted: the entry gate cannot recover CAGR; only the exit
 filter lifts return while preserving the drawdown reduction.)
 
 Each MODERATE row is month-end data forecasting M+1…M+3, so it is applied to
-trading days in M+1 (a +1-month shift — no look-ahead). Walk-forward validated
-(2010–2026): avg IS-optimal exit threshold ≈ +0.2% (SPY), +0.6% (QQQ) — using
-0.0% for both as a practical, sign-only simplification.
+trading days in M+1 (a +1-month shift — no look-ahead). Thresholds: SPY +0.5%
+(calibration break-even; performance-neutral vs 0.0% with slightly better MaxDD),
+QQQ 0.0% (sweep was a wash). See ML_THRESHOLD below.
 
 Reconstructs the current open trade from 2-year history so it can report:
   • HOLD  — entry date/price, peak price, live trailing stop level
@@ -45,8 +45,11 @@ ML_PATTERN = {
     "QQQ": "ndx_moderate_results_*.csv",
 }
 # Suppress exit if ML predicted return > threshold.
-# Walk-forward avg IS-optimal: SPY −2.1%, QQQ +0.2% (2010–2026).
-ML_THRESHOLD = {"SPY": 0.0, "QQQ": 0.0}
+# SPY raised to +0.5% (2026-06-09): the regressor calibration line crosses
+# zero actual at ~+0.5% predicted (positive bias ≈ −0.5% at Pred=0), and a fixed
+# +0.5% vs 0.0% sweep is performance-neutral on CAGR/Sharpe/hit-rate while
+# trimming SPY MaxDD (−19.3% → −16.9%). QQQ left at 0.0% (sweep was a wash).
+ML_THRESHOLD = {"SPY": 0.5, "QQQ": 0.0}
 
 # ── per-symbol strategy parameters ───────────────────────────────────────────
 PARAMS = {

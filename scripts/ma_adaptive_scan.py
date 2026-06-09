@@ -9,6 +9,13 @@ to reconstruct the current trade state and report today's signal.
 
 Moving average type is selectable: ema (default), sma, or wilder.
 
+ML exit filter (EXIT-ONLY, same rule as ema_spy_qqq_scan.py): when an MA-cross
+or trailing-stop EXIT fires, it is suppressed if the SP500/NDX MODERATE monthly
+regressor forecasts a return above ML_THRESHOLD (SPY +0.5%, QQQ 0.0%). Entries
+are never gated. Each MODERATE row is month-end data forecasting M+1…M+3, applied
+to trading days in M+1 (+1-month shift — no look-ahead). The filter degrades
+gracefully to OFF when no current forecast file is found.
+
 Because the grid search takes ~3–6 minutes, optimized parameters are cached
 to data/models/ma_adaptive_params.json. On subsequent runs the cache is reused
 unless --reoptimize is passed or the cache is more than --cache-days old
@@ -21,6 +28,7 @@ Usage
     python3 ma_adaptive_scan.py --ma-type wilder   # Wilder smoothing
     python3 ma_adaptive_scan.py --reoptimize       # force fresh grid search
     python3 ma_adaptive_scan.py --cache-days 0     # always reoptimize
+    python3 ma_adaptive_scan.py --no-ml-filter     # raw signals (filter off)
 """
 from __future__ import annotations
 
@@ -47,6 +55,17 @@ IS_YEARS    = {"ema": 9, "sma": 14, "wilder": 9}   # lookback-sweep optima (EMA/
 TRAIL_STOPS = [0.03, 0.04, 0.05, 0.06]
 TC_BPS      = 5
 MA_TYPES    = ("ema", "sma", "wilder")
+
+# ── ML exit-filter configuration (mirrors ema_spy_qqq_scan.py) ────────────────
+R_DIR      = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/R"
+ML_PATTERN = {
+    "SPY": "sp500_moderate_results_*.csv",
+    "QQQ": "ndx_moderate_results_*.csv",
+}
+# Suppress an exit if the MODERATE predicted return exceeds this threshold.
+# SPY raised to +0.5% on 2026-06-09 (calibration break-even ≈ +0.5%; fixed-hurdle
+# sweep performance-neutral, marginally better SPY MaxDD). QQQ left at 0.0%.
+ML_THRESHOLD = {"SPY": 0.5, "QQQ": 0.0}
 
 _ICONS = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🔵", "FLAT": "⬜"}
 
@@ -258,6 +277,67 @@ def save_cache(params_by_symbol: dict[str, dict], ma_type: str) -> None:
     logger.info(f"Params cached → {CACHE_PATH}")
 
 
+# ── ML prediction loader (mirrors ema_spy_qqq_scan.py) ────────────────────────
+
+def load_ml_predictions() -> dict[str, dict | None]:
+    """Return the MODERATE predicted-return history for each symbol.
+
+    Each CSV row is **month-end** data: a row dated month M is computed from M's
+    close and forecasts the change over M+1…M+3. The forecast is only knowable
+    after M closes, so it is applied to trading days in M+1 (+1-month shift).
+
+    Result keys per symbol:
+      pred          – latest forecast value (float %, most recent row)
+      data_month    – vintage of that forecast (the row's own month, str)
+      applies_month – first month the forecast applies to (data_month + 1, str)
+      pred_by_month – {applies-period → pred} over full history, for replaying
+                      the exit filter during trade reconstruction
+      is_active     – True if the latest forecast still applies this month
+    Returns None for a symbol when no file or no valid prediction row is found.
+    """
+    today         = pd.Timestamp.today()
+    current_month = today.to_period("M")
+    out: dict[str, dict | None] = {}
+    for sym, pattern in ML_PATTERN.items():
+        files = sorted(R_DIR.glob(pattern))
+        if not files:
+            out[sym] = None
+            continue
+        df = pd.read_csv(files[-1], parse_dates=["Date"])
+        valid = df.dropna(subset=["Predicted_Return"])
+        if valid.empty:
+            out[sym] = None
+            continue
+        # Shift +1 month: the month-M forecast applies to trading month M+1.
+        pred_by_month = {
+            (d.to_period("M") + 1): float(r)
+            for d, r in zip(valid["Date"], valid["Predicted_Return"])
+        }
+        data_month    = valid["Date"].iloc[-1].to_period("M")
+        applies_month = data_month + 1
+        out[sym] = {
+            "pred":          float(valid["Predicted_Return"].iloc[-1]),
+            "data_month":    str(data_month),
+            "applies_month": str(applies_month),
+            "pred_by_month": pred_by_month,
+            "is_active":     (current_month - applies_month).n <= 1,
+        }
+    return out
+
+
+def _ml_status_line(r: dict) -> str:
+    """One-line ML filter summary for the scan header."""
+    if r.get("ml_disabled"):
+        return "ML filter: OFF (disabled via --no-ml-filter — raw signals)"
+    if not r.get("ml_filter_on"):
+        if r.get("ml_month"):
+            return f"ML filter: OFF ({r['ml_month']} forecast is stale — re-run MODERATE model)"
+        return "ML filter: OFF (no forecast file found)"
+    sign = "+" if r["ml_pred"] >= 0 else ""
+    return (f"ML filter: ON  |  {r['ml_month']} month-end forecast {sign}{r['ml_pred']:.2f}%  "
+            f"→ applies {r['ml_applies']}+  (threshold {r['ml_threshold']:+.1f}%)")
+
+
 # ── trade reconstruction + signal ─────────────────────────────────────────────
 
 def _cross_up(fast: np.ndarray, slow: np.ndarray, i: int) -> bool:
@@ -268,8 +348,9 @@ def _cross_dn(fast: np.ndarray, slow: np.ndarray, i: int) -> bool:
     return i > 0 and fast[i] < slow[i] and fast[i-1] >= slow[i-1]
 
 
-def analyse(sym: str, df: pd.DataFrame, p: dict) -> dict:
-    """Reconstruct trade state and return today's signal."""
+def analyse(sym: str, df: pd.DataFrame, p: dict, ml_info: dict | None = None,
+            ml_enabled: bool = True) -> dict:
+    """Reconstruct trade state (replaying the ML exit filter) and return today's signal."""
     ef, es   = p["entry_fast"], p["entry_slow"]
     xf, xs   = p["exit_fast"],  p["exit_slow"]
     trail    = p["trail_pct"]
@@ -286,26 +367,45 @@ def analyse(sym: str, df: pd.DataFrame, p: dict) -> dict:
     fx = df["ma_fx"].to_numpy()
     sx = df["ma_sx"].to_numpy()
 
+    # ── ML exit-filter state ──────────────────────────────────────────────────
+    ml_pred       = ml_info["pred"] if ml_info else None
+    ml_threshold  = ML_THRESHOLD[sym]
+    ml_filter_on  = (ml_info is not None and ml_info.get("is_active", False))
+    pred_by_month = ml_info.get("pred_by_month") if ml_info else None
+
     in_pos      = False
     entry_price = 0.0
     entry_date  = None
     peak        = 0.0
 
-    for i in range(1, len(df) - 1):   # walk up to but not including today
+    # Reconstruct through the *prior* bar, replaying the ML exit filter so the
+    # reported open trade matches the strategy actually run. Today's bar is
+    # evaluated separately below so a live BUY/SELL can be emitted.
+    for i in range(1, len(df) - 1):
         if np.isnan(fe[i]) or np.isnan(se[i]):
             continue
+        close_i = df["close"].iloc[i]
         if _cross_up(fe, se, i) and not in_pos:
             in_pos      = True
-            entry_price = df["close"].iloc[i]
+            entry_price = close_i
             entry_date  = df["date"].iloc[i]
-            peak        = entry_price
+            peak        = close_i
         if in_pos:
-            peak = max(peak, df["close"].iloc[i])
-            if _cross_dn(fx, sx, i) or df["close"].iloc[i] <= peak * (1 - trail):
-                in_pos      = False
-                entry_price = 0.0
-                entry_date  = None
-                peak        = 0.0
+            peak = max(peak, close_i)
+            trail_hit = close_i <= peak * (1 - trail)
+            if _cross_dn(fx, sx, i) or trail_hit:
+                bar_month = df["date"].iloc[i].to_period("M")
+                pr = pred_by_month.get(bar_month) if pred_by_month else None
+                if pr is not None and pr > ml_threshold:
+                    # Exit suppressed — stay long; reset the trail anchor so a hit
+                    # stop doesn't re-fire every bar (mirrors the backtest).
+                    if trail_hit:
+                        peak = close_i
+                else:
+                    in_pos      = False
+                    entry_price = 0.0
+                    entry_date  = None
+                    peak        = 0.0
 
     # Today's bar
     n      = len(df) - 1
@@ -317,11 +417,23 @@ def analyse(sym: str, df: pd.DataFrame, p: dict) -> dict:
     entry_now = _cross_up(fe, se, n) and not in_pos
     exit_now  = _cross_dn(fx, sx, n) and in_pos
 
+    ml_suppressed = False
+    exit_reason   = None
+
     if in_pos:
         peak = max(peak, close)
         trail_stop = round(peak * (1 - trail), 2)
         unrealised = (close - entry_price) / entry_price
-        signal = "SELL" if (exit_now or close <= trail_stop) else "HOLD"
+        trail_hit      = close <= trail_stop
+        exit_triggered = exit_now or trail_hit
+        exit_reason    = ("trail" if trail_hit else "ma") if exit_triggered else None
+        if exit_triggered and ml_filter_on and ml_pred is not None and ml_pred > ml_threshold:
+            signal        = "HOLD"
+            ml_suppressed = True
+        elif exit_triggered:
+            signal = "SELL"
+        else:
+            signal = "HOLD"
     elif entry_now:
         signal      = "BUY"
         entry_price = close
@@ -353,6 +465,16 @@ def analyse(sym: str, df: pd.DataFrame, p: dict) -> dict:
         "peak":        round(peak, 2) if peak else None,
         "trail_stop":  trail_stop,
         "unrealised":  unrealised,
+        "exit_reason": exit_reason,
+        # ML filter
+        "ml_pred":       ml_pred,
+        "ml_month":      ml_info["data_month"] if ml_info else None,
+        "ml_applies":    ml_info["applies_month"] if ml_info else None,
+        "ml_suppressed": ml_suppressed,
+        "ml_threshold":  ml_threshold,
+        "ml_filter_on":  ml_filter_on,
+        "ml_disabled":   not ml_enabled,
+        # MA values for diagnostics
         "ma_fe":       round(fe[n], 4),
         "ma_se":       round(se[n], 4),
         "ma_fx":       round(fx[n], 4),
@@ -375,34 +497,42 @@ def print_scan(results: list[dict]) -> None:
     print(f"{'=' * 72}")
 
     for r in results:
-        sig  = r["signal"]
-        icon = _ICONS[sig]
-        mt_  = r["ma_type"].upper()
+        sig   = r["signal"]
+        icon  = "🟡" if r.get("ml_suppressed") else _ICONS[sig]
+        mt_   = r["ma_type"].upper()
+        label = f"{sig} (exit suppressed by ML filter)" if r.get("ml_suppressed") else sig
 
-        print(f"\n{icon} {sig}  —  {r['symbol']}")
+        print(f"\n{icon} {label}  —  {r['symbol']}")
         print(f"   Close  : ${r['close']:.2f}   |   As of : {r['date']}")
+        print(f"   {_ml_status_line(r)}")
         print(f"   Params : entry {mt_}({r['entry_fast']}/{r['entry_slow']})  "
               f"exit {mt_}({r['exit_fast']}/{r['exit_slow']})  "
               f"trail {r['trail_pct']:.0%}  "
               f"[IS Sharpe {r['is_sharpe']:.3f}]")
 
         if sig == "BUY":
-            print(f"   ── ACTION ──────────────────────────────────────────────────")
+            print(f"   ── ACTION ────────────────────────────────────")
             print(f"   Enter at tomorrow's open (or today's close after hours)")
             print(f"   Set {r['trail_pct']:.0%} trailing stop — initial stop : "
                   f"${r['trail_stop']:.2f}  ({r['trail_pct']:.0%} below ${r['close']:.2f})")
-            print(f"   ── {mt_} VALUES ─────────────────────────────────────────────")
+            print(f"   ── {mt_} VALUES ──────────────────────────────")
             print(f"   Entry {mt_}({r['entry_fast']}) {r['ma_fe']:.4f}  >  "
                   f"{mt_}({r['entry_slow']}) {r['ma_se']:.4f}  "
                   f"(gap {r['entry_gap']:+.3f}%)")
 
         elif sig == "HOLD":
             cushion = (r["close"] / r["trail_stop"] - 1) * 100 if r["trail_stop"] else 0.0
-            print(f"   ── OPEN TRADE ──────────────────────────────────────────────")
+            if r.get("ml_suppressed"):
+                reason = r["exit_reason"].upper() if r["exit_reason"] else "SIGNAL"
+                sign   = "+" if r["ml_pred"] >= 0 else ""
+                print(f"   ── EXIT SUPPRESSED ──────────────────────────-")
+                print(f"   {reason} exit fired — overridden: pred {sign}{r['ml_pred']:.2f}%  "
+                      f">  threshold {r['ml_threshold']:+.1f}%  → staying long")
+            print(f"   ── OPEN TRADE ───────────────────────────────-")
             print(f"   Entry  : ${r['entry_price']:.2f}  on  {r['entry_date']}")
             print(f"   Peak   : ${r['peak']:.2f}   |   Unrealised : {r['unrealised']:+.2%}")
             print(f"   Stop   : ${r['trail_stop']:.2f}  ({cushion:.1f}% cushion)")
-            print(f"   ── {mt_} VALUES ─────────────────────────────────────────────")
+            print(f"   ── {mt_} VALUES ──────────────────────────────")
             print(f"   Entry {mt_}({r['entry_fast']}) {r['ma_fe']:.4f}  vs  "
                   f"{mt_}({r['entry_slow']}) {r['ma_se']:.4f}  "
                   f"(gap {r['entry_gap']:+.3f}%)")
@@ -410,10 +540,16 @@ def print_scan(results: list[dict]) -> None:
                   f"{mt_}({r['exit_slow']}) {r['ma_sx']:.4f}")
 
         elif sig == "SELL":
-            print(f"   ── ACTION ──────────────────────────────────────────────────")
+            print(f"   ── ACTION ───────────────────────────────────")
             print(f"   Exit at tomorrow's open")
             print(f"   Entry was : ${r['entry_price']:.2f}  on  {r['entry_date']}")
             print(f"   Unrealised P&L at today's close : {r['unrealised']:+.2%}")
+            if r["ml_filter_on"] and r["ml_pred"] is not None:
+                sign = "+" if r["ml_pred"] >= 0 else ""
+                print(f"   ML filter did not suppress: pred {sign}{r['ml_pred']:.2f}%  "
+                      f"≤  threshold {r['ml_threshold']:+.1f}%")
+            elif not r["ml_filter_on"]:
+                print(f"   ML filter inactive (no recent forecast) — exit proceeds")
 
         elif sig == "FLAT":
             print(f"   No position.  Watching for {mt_}({r['entry_fast']}) "
@@ -436,6 +572,8 @@ def main() -> None:
                         help="Ignore cache and rerun grid search")
     parser.add_argument("--cache-days", type=int, default=30,
                         help="Max age of cached params in days (default 30; 0 = always reoptimize)")
+    parser.add_argument("--no-ml-filter", action="store_true",
+                        help="Disable the ML exit filter — show raw MA-crossover signals")
     parser.add_argument("--jobs",       type=int, default=-1)
     args = parser.parse_args()
 
@@ -460,8 +598,30 @@ def main() -> None:
     warmup_days = max(max_period * 3, 120)   # generous buffer for SMA NaN warm-up
     recent = fetch_history(SYMBOLS, years=3)  # 3yr is always enough for reconstruction
 
+    # ── ML exit-filter forecasts ───────────────────────────────────────────────
+    if args.no_ml_filter:
+        logger.info("ML exit filter disabled (--no-ml-filter) — showing raw MA signals")
+        ml_preds = {sym: None for sym in SYMBOLS}
+    else:
+        logger.info("Loading ML predictions …")
+        ml_preds = load_ml_predictions()
+        for sym in SYMBOLS:
+            info = ml_preds.get(sym)
+            if info is None:
+                logger.info(f"  {sym}: no forecast file found — ML filter inactive")
+            elif not info["is_active"]:
+                logger.info(f"  {sym}: {info['data_month']} forecast no longer applies — ML filter inactive")
+            else:
+                sign = "+" if info["pred"] >= 0 else ""
+                logger.info(f"  {sym}: {info['data_month']} month-end forecast {sign}{info['pred']:.2f}% "
+                            f"(applies {info['applies_month']}+) vs threshold {ML_THRESHOLD[sym]:+.1f}%")
+
     # ── signal scan ───────────────────────────────────────────────────────────
-    results = [analyse(sym, recent[sym], params[sym]) for sym in SYMBOLS]
+    results = [
+        analyse(sym, recent[sym], params[sym], ml_preds.get(sym),
+                ml_enabled=not args.no_ml_filter)
+        for sym in SYMBOLS
+    ]
     print_scan(results)
 
 
