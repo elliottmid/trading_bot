@@ -217,6 +217,16 @@ only the exit filter was promoted.
 - **Forecast alignment:** each MODERATE row is **month-end** data forecasting
   M+1…M+3, so it is applied to trading days in **M+1** (+1-month shift — no
   look-ahead). The scanner and backtest use the same shift.
+- **QQQ source switched to the M2PI model (2026-06-10).** `ma_adaptive_scan.py`
+  and `backtest_adaptive_vs_static_ml.py` now glob `ndx_moderate_m2pi_results_*.csv`
+  (from `R/NDX_MODERATE_2000_M2PI.py` — NDX MODERATE + M2/Personal-Income growth
+  features; walk-forward L/S CAGR 36.3%→37.8%, Sharpe 1.59→1.65, accuracy
+  69.4%→70.0% vs the original. Tournament write-up:
+  `R/NDX_FEATURE_TOURNAMENT_26-06-10.md`). SPY still reads
+  `sp500_moderate_results_*.csv`. The scan's ML loader also now prefers the
+  forecast row that **applies to the current month** — a mid-month model rerun
+  appends a partial-month row whose forecast applies to next month, and the old
+  take-the-last-row logic would have applied it a month early.
 - **Scanner (`ema_spy_qqq_scan.py`):** reconstructs the open trade through the
   *prior* bar replaying the filter, then evaluates today's bar live. (Fixed a
   prior bug where the loop consumed today's exit and never showed `SELL`.)
@@ -269,6 +279,19 @@ only the exit filter was promoted.
 - **Caveat — concentrated tail:** worst suppressed-hold drawdown is **-13.0%
   (SPY) / -16.9% (QQQ)** — nearly the entire strategy drawdown occurs in months
   the model is wrong. The Sharpe edge buys return by accepting that tail.
+- **Suppression cap — tested and rejected (2026-06-10).** Hypothesis: a trail-hit
+  suppression resets the trail anchor to that bar's close, so a 2nd+ trail exit
+  can be suppressed in the same month (each ~trail% lower) — capping at 1/month
+  should bound the intramonth tail in months the forecast is wrong. Tested via
+  `backtest_adaptive_vs_static_ml.py --cap 1` (`_cap1` arms; MA-cross
+  suppressions never capped). Result: **cap hurts everywhere** — SPY adaptive
+  CAGR 16.0%→13.8%, Sharpe 1.17→1.07; QQQ adaptive 20.6%→17.4%, 1.17→1.07;
+  MaxDD barely moves (only QQQ static improves, -23.8%→-17.9%). Year-by-year
+  shows why: capped exits fire in crash-then-rip months (2020: QQQ static
+  57%→48%, SPY adaptive 50%→29%) where holding through the 2nd+ trail hit was
+  exactly right. Deep intramonth selloffs with a bullish monthly forecast tend
+  to mean-revert; unlimited suppression is the validated production behavior.
+  Results: `results/adaptive_vs_static_ml_cap1_spythr+0.5_2026-06-10.*`.
 - The +1-month look-ahead fix barely moved results (SPY ~+13.3%→+13.1%) because
   the 3-month forecast is highly autocorrelated month-to-month.
 

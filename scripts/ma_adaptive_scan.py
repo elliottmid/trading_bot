@@ -60,11 +60,11 @@ MA_TYPES    = ("ema", "sma", "wilder")
 R_DIR      = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/R"
 ML_PATTERN = {
     "SPY": "sp500_moderate_results_*.csv",
-    "QQQ": "ndx_moderate_results_*.csv",
+    "QQQ": "ndx_moderate_m2pi_results_*.csv",   # M2PI model (promoted 2026-06-10)
 }
 # Suppress an exit if the MODERATE predicted return exceeds this threshold.
-# SPY raised to +0.5% on 2026-06-09 (calibration break-even ≈ +0.5%; fixed-hurdle
-# sweep performance-neutral, marginally better SPY MaxDD). QQQ left at 0.0%.
+# SPY +0.5%: measured better SPY MaxDD (−13.7% vs −19.5%, 2010–26) at the same
+# Sharpe (1.15) — see results/adaptive_vs_static_ml_*spythr+0.5*. QQQ left at 0.0%.
 ML_THRESHOLD = {"SPY": 0.5, "QQQ": 0.0}
 
 _ICONS = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🔵", "FLAT": "⬜"}
@@ -315,8 +315,16 @@ def load_ml_predictions() -> dict[str, dict | None]:
         }
         data_month    = valid["Date"].iloc[-1].to_period("M")
         applies_month = data_month + 1
+        pred          = float(valid["Predicted_Return"].iloc[-1])
+        # Prefer the forecast that applies to the *current* month: a mid-month
+        # model rerun appends a partial-month row whose forecast applies to
+        # NEXT month — taking the last row blindly would apply it a month early.
+        if current_month in pred_by_month and applies_month > current_month:
+            pred          = pred_by_month[current_month]
+            data_month    = current_month - 1
+            applies_month = current_month
         out[sym] = {
-            "pred":          float(valid["Predicted_Return"].iloc[-1]),
+            "pred":          pred,
             "data_month":    str(data_month),
             "applies_month": str(applies_month),
             "pred_by_month": pred_by_month,
@@ -430,6 +438,12 @@ def analyse(sym: str, df: pd.DataFrame, p: dict, ml_info: dict | None = None,
         if exit_triggered and ml_filter_on and ml_pred is not None and ml_pred > ml_threshold:
             signal        = "HOLD"
             ml_suppressed = True
+            if trail_hit:
+                # Mirror the replay's anchor reset: the effective stop going
+                # forward re-anchors at today's close, so report that level
+                # rather than the breached (stale) one.
+                peak       = close
+                trail_stop = round(close * (1 - trail), 2)
         elif exit_triggered:
             signal = "SELL"
         else:
@@ -528,6 +542,8 @@ def print_scan(results: list[dict]) -> None:
                 print(f"   ── EXIT SUPPRESSED ──────────────────────────-")
                 print(f"   {reason} exit fired — overridden: pred {sign}{r['ml_pred']:.2f}%  "
                       f">  threshold {r['ml_threshold']:+.1f}%  → staying long")
+                if r["exit_reason"] == "trail":
+                    print(f"   Trail re-anchored at today's close — stop below is the new effective level")
             print(f"   ── OPEN TRADE ───────────────────────────────-")
             print(f"   Entry  : ${r['entry_price']:.2f}  on  {r['entry_date']}")
             print(f"   Peak   : ${r['peak']:.2f}   |   Unrealised : {r['unrealised']:+.2%}")
