@@ -20,6 +20,7 @@ Usage
 """
 from __future__ import annotations
 
+import math
 import sys
 import argparse
 import logging
@@ -28,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, cpu_count
 
 logging.basicConfig(
     level=logging.INFO,
@@ -106,84 +107,83 @@ def backtest_symbol_combo(
 ) -> dict:
     """
     Backtest one symbol with separate entry and exit EMA pairs.
+    Signal fires at bar i; execution is at the close of bar i+1.
 
     Returns a dict of scalar metrics (or None if too few bars).
     """
-    df = sym_df.copy().reset_index(drop=True)
-    if len(df) < max(es, xs) + 5:
+    if len(sym_df) < max(es, xs) + 5:
         return None
 
-    symbol = df["symbol"].iloc[0]
+    symbol = sym_df["symbol"].iloc[0]
 
-    entry_sig = _crossover_signal(df[f"ema_{ef}"], df[f"ema_{es}"])
-    exit_sig  = _crossover_signal(df[f"ema_{xf}"], df[f"ema_{xs}"])
+    entry_sig = _crossover_signal(sym_df[f"ema_{ef}"], sym_df[f"ema_{es}"])
+    exit_sig  = _crossover_signal(sym_df[f"ema_{xf}"], sym_df[f"ema_{xs}"])
 
-    # Walk through bars, tracking trades
+    close     = sym_df["close"].to_numpy()
+    entry_arr = entry_sig.to_numpy()
+    exit_arr  = exit_sig.to_numpy()
+    n         = len(close)
+    tc_frac   = tc_bps / 10_000
+
     in_position = False
-    entry_price = None
-    entry_idx   = None
-    pnls        = []
-    hold_days_list = []
-    tc_frac = tc_bps / 10_000
+    entry_price = 0.0
+    entry_idx   = 0
+    prev_eq     = 0.0
+    pnls            = []
+    hold_days_list  = []
+    daily_ret       = np.zeros(n)
 
-    for i in range(len(df)):
-        if not in_position and entry_sig.iloc[i] == 1:
+    # i is the execution bar; the signal that triggers it fired at i-1
+    for i in range(1, n):
+        sig_i = i - 1
+
+        if not in_position and entry_arr[sig_i] == 1:
             in_position = True
-            entry_price = df["close"].iloc[i]
+            entry_price = close[i]
             entry_idx   = i
-        elif in_position and exit_sig.iloc[i] == -1:
-            exit_price = df["close"].iloc[i]
-            pnl = (exit_price - entry_price) / entry_price - 2 * tc_frac
-            pnls.append(pnl)
-            hold_days_list.append(i - entry_idx)
-            in_position = False
-            entry_price = None
-            entry_idx   = None
+            prev_eq     = 0.0
+            daily_ret[i] -= tc_frac          # entry transaction cost
+
+        if in_position:
+            eq = (close[i] - entry_price) / entry_price
+            daily_ret[i] += eq - prev_eq     # incremental MTM (zero on entry bar)
+            prev_eq = eq
+
+            if exit_arr[sig_i] == -1:
+                daily_ret[i] -= tc_frac      # exit transaction cost
+                pnls.append(eq - 2 * tc_frac)
+                hold_days_list.append(i - entry_idx)
+                in_position = False
+                prev_eq     = 0.0
 
     # ---- metrics ----
     n_trades = len(pnls)
     if n_trades == 0:
         return {
-            "symbol": symbol,
-            "trades": 0,
+            "symbol":          symbol,
+            "trades":          0,
             "strategy_return": 0.0,
-            "cagr": 0.0,
-            "sharpe": 0.0,
-            "win_rate": 0.0,
-            "avg_win": 0.0,
-            "avg_loss": 0.0,
-            "avg_hold_days": 0.0,
-            "buy_hold_return": (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0],
+            "cagr":            0.0,
+            "sharpe":          0.0,
+            "win_rate":        0.0,
+            "avg_win":         0.0,
+            "avg_loss":        0.0,
+            "avg_hold_days":   0.0,
+            "buy_hold_return": (close[-1] - close[0]) / close[0],
         }
 
-    pnls_arr    = np.array(pnls)
-    strat_ret   = float(np.prod(1 + pnls_arr) - 1)
-    win_mask    = pnls_arr > 0
-    win_rate    = win_mask.mean()
-    avg_win     = pnls_arr[win_mask].mean()  if win_mask.any()  else 0.0
-    avg_loss    = pnls_arr[~win_mask].mean() if (~win_mask).any() else 0.0
-    avg_hold    = float(np.mean(hold_days_list))
-    bh_ret      = (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0]
+    pnls_arr  = np.array(pnls)
+    strat_ret = float(np.prod(1 + pnls_arr) - 1)
+    win_mask  = pnls_arr > 0
+    win_rate  = win_mask.mean()
+    avg_win   = pnls_arr[win_mask].mean()  if win_mask.any()   else 0.0
+    avg_loss  = pnls_arr[~win_mask].mean() if (~win_mask).any() else 0.0
+    avg_hold  = float(np.mean(hold_days_list))
+    bh_ret    = (close[-1] - close[0]) / close[0]
 
-    years = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).days / 365.25
-    cagr  = float((1 + strat_ret) ** (1 / years) - 1) if years > 0 else 0.0
-
-    # Daily equity for Sharpe — mark-to-market while in position
-    daily_ret = np.zeros(len(df))
-    in_pos  = False
-    ep      = None
-    prev_eq = 0.0
-    for i in range(len(df)):
-        if not in_pos and entry_sig.iloc[i] == 1:
-            in_pos = True
-            ep = df["close"].iloc[i]
-            prev_eq = 0.0
-        elif in_pos and exit_sig.iloc[i] == -1:
-            in_pos = False
-        if in_pos and ep is not None:
-            eq = (df["close"].iloc[i] - ep) / ep
-            daily_ret[i] = eq - prev_eq
-            prev_eq = eq
+    years = (sym_df["timestamp"].iloc[-1] - sym_df["timestamp"].iloc[0]).days / 365.25
+    base  = 1 + strat_ret
+    cagr  = float(base ** (1 / years) - 1) if years > 0 and base > 0 else 0.0
 
     vol    = daily_ret.std()
     sharpe = float(daily_ret.mean() / vol * np.sqrt(252)) if vol > 0 else 0.0
@@ -235,6 +235,7 @@ def run_combo(
         # universe averages
         "mean_cagr":      mdf["cagr"].mean(),
         "mean_sharpe":    mdf["sharpe"].mean(),
+        "std_sharpe":     mdf["sharpe"].std(),
         "mean_win_rate":  mdf["win_rate"].mean(),
         "mean_trades":    mdf["trades"].mean(),
         "mean_hold_days": mdf["avg_hold_days"].mean(),
@@ -244,6 +245,18 @@ def run_combo(
         "pct_profitable": (mdf["strategy_return"] > 0).mean(),
         "symbols_tested": len(mdf),
     }
+
+
+# ---------------------------------------------------------------------------
+# Batch wrapper — one serialisation of sym_groups per worker, not per combo
+# ---------------------------------------------------------------------------
+
+def _run_combo_batch(
+    sym_groups: dict,
+    combo_batch: list[tuple[int, int, int, int]],
+    tc_bps: float,
+) -> list[dict | None]:
+    return [run_combo(sym_groups, ef, es, xf, xs, tc_bps) for ef, es, xf, xs in combo_batch]
 
 
 # ---------------------------------------------------------------------------
@@ -285,15 +298,20 @@ def run_grid_search(
 
     # Split into per-symbol dict so workers don't re-filter the full frame
     sym_groups = {sym: g for sym, g in df.groupby("symbol", sort=False)}
-    logger.info(f"Running {len(combos):,} combos on {len(sym_groups)} symbols "
-                f"(jobs={n_jobs}, tc={tc_bps}bps) …")
 
-    results = Parallel(n_jobs=n_jobs, verbose=5)(
-        delayed(run_combo)(sym_groups, ef, es, xf, xs, tc_bps)
-        for ef, es, xf, xs in combos
+    # Batch combos so sym_groups is serialised once per worker, not once per combo
+    n_workers = cpu_count() if n_jobs < 0 else max(1, n_jobs)
+    chunk     = math.ceil(len(combos) / n_workers)
+    batches   = [combos[i : i + chunk] for i in range(0, len(combos), chunk)]
+    logger.info(f"Running {len(combos):,} combos in {len(batches)} batches on "
+                f"{len(sym_groups)} symbols (jobs={n_jobs}, tc={tc_bps}bps) …")
+
+    batch_results = Parallel(n_jobs=n_jobs)(
+        delayed(_run_combo_batch)(sym_groups, batch, tc_bps)
+        for batch in batches
     )
 
-    rows = [r for r in results if r is not None]
+    rows = [r for batch in batch_results for r in batch if r is not None]
     if not rows:
         logger.error("No results returned — check your data file.")
         sys.exit(1)
@@ -311,17 +329,19 @@ def run_grid_search(
 def print_top_n(results_df: pd.DataFrame, n: int = 20) -> None:
     cols = [
         "rank", "entry_fast", "entry_slow", "exit_fast", "exit_slow",
-        "mean_sharpe", "mean_cagr", "mean_win_rate", "mean_trades",
+        "mean_sharpe", "std_sharpe", "mean_cagr", "mean_win_rate", "mean_trades",
         "mean_hold_days", "pct_profitable",
     ]
     fmt = {
         "mean_sharpe":    "{:.3f}".format,
+        "std_sharpe":     "{:.3f}".format,
         "mean_cagr":      "{:.2%}".format,
         "mean_win_rate":  "{:.2%}".format,
         "mean_trades":    "{:.1f}".format,
         "mean_hold_days": "{:.1f}".format,
         "pct_profitable": "{:.2%}".format,
     }
+
     top = results_df.head(n)[cols].copy()
     for col, fn in fmt.items():
         top[col] = top[col].map(fn)

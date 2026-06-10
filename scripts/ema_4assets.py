@@ -35,9 +35,9 @@ SYMBOLS = {
     "XLY":  "Consumer Discretionary Select Sector SPDR",
 }
 
-ENTRY_FAST = 9
+ENTRY_FAST = 7
 ENTRY_SLOW = 11
-EXIT_FAST  = 10
+EXIT_FAST  = 17
 EXIT_SLOW  = 20
 MIN_BARS   = EXIT_SLOW * 4
 
@@ -114,7 +114,7 @@ def compute_signals(long_df: pd.DataFrame) -> pd.DataFrame:
 
 _SIGNAL_ORDER = {"BUY": 0, "SELL": 1, "HOLD": 2, "FLAT": 3}
 _SIGNAL_LABEL = {
-    "BUY":  "🟢 BUY",
+    "BUY":  "🟢 BUY w 4% trailing stop",
     "SELL": "🔴 SELL",
     "HOLD": "🔵 HOLD",
     "FLAT": "⬜ FLAT",

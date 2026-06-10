@@ -9,8 +9,8 @@ EQUITY_BROAD = {
     "IWM": "Russell 2000",
     "RSP": "Invesco S&P 500 Equal Weight",
     "SCHD": "Schwab US Dividend Equity",
-    "BRK/B": "Berkshire Hathaway B",
     "VT": "Vanguard Total World Stock",
+    "VOOG": "Vanguard S&P 500 Growth",
 }
 
 SECTOR_SPDR = {
@@ -60,20 +60,16 @@ BONDS = {
     "LQD": "Investment Grade Corporate",
 }
 
-CURRENCIES = {
-    "FXE": "Euro",
-    "FXY": "Japanese Yen",
-    "FXB": "British Pound",
-    "FXA": "Australian Dollar",
-    "CurrencyShares": "Multiple",
+THEMATIC = {
+    "SMH": "VanEck Semiconductor",
+    "PPA": "Invesco Aerospace & Defense",
 }
 
 # Alternative/growth
 GROWTH = {
     "TQQQ": "Nasdaq 100 3x Leverage",
     "UPRO": "S&P 500 3x Leverage",
-    "SQQQ": "Nasdaq 100 -3x (bearish)",
-    "BTC": "Bitcoin",
+    "BTC": "Bitcoin ETF",
     "CHAT": "Chatbot/AI ETF",
 }
 
@@ -85,7 +81,7 @@ UNIVERSE = {
     **INTERNATIONAL,
     **COMMODITIES,
     **BONDS,
-    **CURRENCIES,
+    **THEMATIC,
     **GROWTH,
 }
 
@@ -93,6 +89,7 @@ UNIVERSE = {
 PRIMARY_UNIVERSE = {
     **EQUITY_BROAD,
     **SECTOR_SPDR,
+    **THEMATIC,
 }
 
 if __name__ == "__main__":

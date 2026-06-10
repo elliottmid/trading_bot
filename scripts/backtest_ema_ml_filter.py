@@ -76,7 +76,10 @@ def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
     as walkforward_ema_optimization.py.  EMA values are properly initialised
     because they are computed on the full price history before being passed in.
 
-    Returns: (daily_rets, n_trades, n_suppressed, n_blocked, max_suppressed_dd).
+    Returns: (daily_rets, trade_log, daily_signals, n_trades, n_suppressed,
+              n_blocked, max_suppressed_dd).
+      trade_log    – list[dict]  each completed round-trip trade
+      daily_signals – list[dict] every bar's state (signal, MA values, ML pred)
     max_suppressed_dd (<=0) is the worst drawdown measured from the peak at the
     moment an exit was first suppressed until the position is finally closed — it
     quantifies the downside risk of holding through a suppressed stop (HIGH-3).
@@ -92,10 +95,18 @@ def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
     in_short = False       # long/short mode: currently holding short
     peak     = 0.0
     daily_rets = []
+    trade_log    = []      # completed round-trip trades
+    daily_signals = []     # every bar's state
     n_trades = n_sup = n_blk = 0
     supp_active = False    # currently holding past a suppressed exit
     supp_peak   = 0.0      # peak at the moment suppression began
     max_supp_dd = 0.0
+    # Pending trade state for round-trip tracking
+    pending_entry_date = None
+    pending_entry_price = 0.0
+    pending_direction = None  # 'long' or 'short'
+    pending_suppressed = False   # was the exit ML-suppressed?
+    pending_exit_trigger = None  # 'trail' | 'ma_cross'
 
     for k in range(1, len(idxs)):
         i      = idxs[k]
@@ -128,6 +139,9 @@ def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                     in_pos = False
                     supp_active = False
                     n_trades += 1
+                    # Record exit details for trade log
+                    pending_suppressed  = False
+                    pending_exit_trigger = "trail" if trail_exit else "ma_cross"
                     if long_short:
                         in_short = True   # stay invested — flip to short
             else:
@@ -166,7 +180,85 @@ def simulate_period(closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                     n_blk += 1
                 daily_rets.append(0.0)
 
-    return np.array(daily_rets), n_trades, n_sup, n_blk, max_supp_dd
+        # ── daily signal record ──
+        bar_date = pd.Timestamp(dates[i]).date()
+        if in_pos:
+            sig = "LONG"
+        elif in_short:
+            sig = "SHORT"
+        else:
+            sig = "FLAT"
+
+        daily_signals.append({
+            "date":            bar_date,
+            "symbol":          None,   # filled by caller
+            "signal":          sig,
+            "close":           round(float(c_cur), 4),
+            "ema_ef":          round(float(ema_ef[i]), 4),
+            "ema_es":          round(float(ema_es[i]), 4),
+            "ema_xf":          round(float(ema_xf[i]), 4),
+            "ema_xs":          round(float(ema_xs[i]), 4),
+            "ml_pred":         round(float(pred_ret), 4) if pred_ret is not None else None,
+            "in_trade":        in_pos or in_short,
+            "pending_entry":   pending_entry_date is not None,
+        })
+
+        # Close pending long trade
+        if pending_entry_date is not None and pending_direction == "long" and not in_pos:
+            trade_log.append({
+                "symbol":         None,
+                "side":           "long",
+                "entry_date":     pending_entry_date,
+                "exit_date":      bar_date,
+                "entry_price":    round(pending_entry_price, 4),
+                "exit_price":     round(float(c_cur), 4),
+                "return_pct":     round(float(c_cur / pending_entry_price - 1.0), 6),
+                "exit_triggered": pending_exit_trigger or "unknown",
+                "ml_suppressed":  pending_suppressed,
+                "ml_blocked":     False,
+            })
+            pending_entry_date = None
+            pending_direction  = None
+            pending_suppressed = False
+            pending_exit_trigger = None
+
+        # Close pending short trade
+        if pending_entry_date is not None and pending_direction == "short" and not in_short:
+            trade_log.append({
+                "symbol":         None,
+                "side":           "short",
+                "entry_date":     pending_entry_date,
+                "exit_date":      bar_date,
+                "entry_price":    round(pending_entry_price, 4),
+                "exit_price":     round(float(c_cur), 4),
+                "return_pct":     round(float(pending_entry_price / c_cur - 1.0), 6),
+                "exit_triggered": "entry_cross",
+                "ml_suppressed":  False,
+                "ml_blocked":     False,
+            })
+            pending_entry_date = None
+            pending_direction  = None
+            pending_suppressed = False
+            pending_exit_trigger = None
+
+        # Open pending long trade (entry just fired)
+        if in_pos and pending_entry_date is None:
+            pending_entry_date = bar_date
+            pending_entry_price = float(c_cur)
+            pending_direction   = "long"
+            pending_suppressed  = False
+            pending_exit_trigger = None
+
+        # Open pending short trade (flip from long to short)
+        if in_short and pending_entry_date is None:
+            pending_entry_date = bar_date
+            pending_entry_price = float(c_cur)
+            pending_direction   = "short"
+            pending_suppressed  = False
+            pending_exit_trigger = None
+
+    return (np.array(daily_rets), trade_log, daily_signals,
+            n_trades, n_sup, n_blk, max_supp_dd)
 
 
 # ── Performance metrics ───────────────────────────────────────────────────────
@@ -223,6 +315,8 @@ def run_all(sym, prices_df_full, pred_df):
     n_years   = (int(oos_mask.sum()) - 1) / 252.0
 
     rows = []
+    all_trades = []    # {sym: [trade_dicts]}
+    all_signals = []   # {sym: [signal_dicts]}
 
     # BH (OOS slice)
     bh_rets = prices_df_full.loc[oos_mask, "bh_equity"].pct_change().fillna(0.0).values[1:]
@@ -235,10 +329,15 @@ def run_all(sym, prices_df_full, pred_df):
     }
 
     # Baseline EMA (no filter)
-    br, bt, _, _, _ = simulate_period(
+    br, bl_trades, bl_signals, bt, _, _, _ = simulate_period(
         closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
         pred_dict, params, oos_start, oos_end
     )
+    # Populate symbol field
+    for t in bl_trades: t["symbol"] = sym
+    for s in bl_signals: s["symbol"] = sym
+    all_trades.extend(bl_trades)
+    all_signals.extend(bl_signals)
     baseline = {
         "symbol": sym, "variant": "baseline", "threshold": np.nan,
         "cagr": _cagr(br, n_years),
@@ -250,7 +349,7 @@ def run_all(sym, prices_df_full, pred_df):
 
     for thresh in THRESHOLDS:
         for name, kw_fn in VARIANTS:
-            rets, nt, ns, nb, msdd = simulate_period(
+            rets, st_trades, st_signals, nt, ns, nb, msdd = simulate_period(
                 closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                 pred_dict, params, oos_start, oos_end, **kw_fn(thresh)
             )
@@ -263,7 +362,7 @@ def run_all(sym, prices_df_full, pred_df):
                 "max_supp_dd": msdd,
             })
 
-    return rows
+    return rows, all_trades, all_signals
 
 
 # ── Walk-forward threshold validation ────────────────────────────────────────
@@ -307,6 +406,8 @@ def run_walkforward_threshold(sym, prices_df_full, pred_df):
     daily_by_variant = {v: [] for v, _ in VARIANTS}
     daily_by_variant["bh"]       = []
     daily_by_variant["baseline"] = []
+    all_trades = []
+    all_signals = []
 
     for oos_year in range(2010, 2027):
         is_start  = pd.Timestamp(f"{oos_year - IS_YEARS_WF}-01-01")
@@ -322,10 +423,14 @@ def run_walkforward_threshold(sym, prices_df_full, pred_df):
         oos_bh   = prices_df_full.loc[oos_mask, "bh_equity"].pct_change().fillna(0.0).values[1:]
         bh_ret   = float(np.prod(1.0 + oos_bh) - 1.0) if len(oos_bh) else np.nan
 
-        bl_rets, bl_t, _, _, _ = simulate_period(
+        bl_rets, bl_trades, bl_signals, bl_t, _, _, _ = simulate_period(
             closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
             pred_dict, params, oos_start, oos_end
         )
+        for t in bl_trades: t["symbol"] = sym
+        for s in bl_signals: s["symbol"] = sym
+        all_trades.extend(bl_trades)
+        all_signals.extend(bl_signals)
         bl_ret = float(np.prod(1.0 + bl_rets) - 1.0) if len(bl_rets) else np.nan
         daily_by_variant["bh"].append(oos_bh)
         daily_by_variant["baseline"].append(bl_rets)
@@ -336,7 +441,7 @@ def run_walkforward_threshold(sym, prices_df_full, pred_df):
             best_is_sharpe = -np.inf
 
             for thresh in THRESHOLDS:
-                rets, _, _, _, _ = simulate_period(
+                rets, _, _, _, _, _, _ = simulate_period(
                     closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                     pred_dict, params, is_start, is_end, **kw_fn(thresh)
                 )
@@ -348,10 +453,14 @@ def run_walkforward_threshold(sym, prices_df_full, pred_df):
                     best_thresh = thresh
 
             # ── OOS: apply selected threshold ──
-            oos_rets, n_t, n_s, n_b, n_msdd = simulate_period(
+            oos_rets, oos_trades, oos_signals, n_t, n_s, n_b, n_msdd = simulate_period(
                 closes, dates, ema_ef, ema_es, ema_xf, ema_xs,
                 pred_dict, params, oos_start, oos_end, **kw_fn(best_thresh)
             )
+            for t in oos_trades: t["symbol"] = sym
+            for s in oos_signals: s["symbol"] = sym
+            all_trades.extend(oos_trades)
+            all_signals.extend(oos_signals)
             daily_by_variant[vname].append(oos_rets)
 
             rows.append({
@@ -375,7 +484,7 @@ def run_walkforward_threshold(sym, prices_df_full, pred_df):
     # Concatenate per-variant OOS daily returns for a true daily-chained MaxDD.
     daily_concat = {v: (np.concatenate(arrs) if arrs else np.array([]))
                     for v, arrs in daily_by_variant.items()}
-    return rows, daily_concat
+    return rows, daily_concat, all_trades, all_signals
 
 
 def wf_chain_stats(rows, variant, daily_map=None):
@@ -677,6 +786,8 @@ def main():
     all_rows     = []
     all_wf_rows  = []
     all_wf_daily = {}   # {sym: {series_name: daily-return array}} for daily MaxDD
+    all_trades   = []
+    all_signals  = []
 
     for sym in ["SPY", "QQQ"]:
         print(f"\n{'='*55}\n{sym}")
@@ -686,8 +797,10 @@ def main():
               f"{prices_df_full['date'].iloc[0].date()} → {prices_df_full['date'].iloc[-1].date()}")
 
         # ── In-sample threshold sweep (existing analysis) ──
-        rows = run_all(sym, prices_df_full, pred_df)
+        rows, sym_trades, sym_signals = run_all(sym, prices_df_full, pred_df)
         all_rows.extend(rows)
+        all_trades.extend(sym_trades)
+        all_signals.extend(sym_signals)
 
         sub = pd.DataFrame(rows)
         bh  = sub[sub["variant"] == "bh"].iloc[0]
@@ -703,9 +816,11 @@ def main():
 
         # ── Walk-forward threshold validation ──
         print(f"\n  Running walk-forward threshold validation ({IS_YEARS_WF}yr IS, 17 OOS years)…")
-        wf_rows, wf_daily = run_walkforward_threshold(sym, prices_df_full, pred_df)
+        wf_rows, wf_daily, wf_trades, wf_signals = run_walkforward_threshold(sym, prices_df_full, pred_df)
         all_wf_rows.extend(wf_rows)
         all_wf_daily[sym] = wf_daily
+        all_trades.extend(wf_trades)
+        all_signals.extend(wf_signals)
 
         for vname, _ in VARIANTS:
             st = wf_chain_stats(wf_rows, vname, wf_daily)
@@ -727,6 +842,18 @@ def main():
     print(f"WF results CSV → {wf_csv}")
 
     write_wf_markdown(all_wf_rows, all_wf_daily, RESULTS / f"ema_ml_wf_threshold_{TODAY_STR}.md")
+
+    # ── Write trade log CSV ──
+    trade_csv = RESULTS / f"ema_ml_filter_trades_{TODAY_STR}.csv"
+    if all_trades:
+        pd.DataFrame(all_trades).to_csv(trade_csv, index=False)
+        print(f"Trade log CSV  → {trade_csv}")
+
+    # ── Write daily signal log CSV ──
+    signal_csv = RESULTS / f"ema_ml_filter_signals_{TODAY_STR}.csv"
+    if all_signals:
+        pd.DataFrame(all_signals).to_csv(signal_csv, index=False)
+        print(f"Signal log CSV → {signal_csv}")
 
 
 if __name__ == "__main__":
