@@ -237,6 +237,12 @@ def analyse(sym: str, df: pd.DataFrame, p: dict, ml_info: dict | None = None) ->
         if exit_triggered and ml_filter_on and ml_pred > ml_threshold:
             signal       = "HOLD"
             ml_suppressed = True
+            if trail_hit:
+                # Mirror the replay's anchor reset: the effective stop going
+                # forward re-anchors at today's close, so report that level
+                # rather than the breached (stale) one.
+                peak       = close
+                trail_stop = round(close * (1 - trail), 2)
         elif exit_triggered:
             signal = "SELL"
         else:
@@ -344,6 +350,8 @@ def print_scan(results: list[dict]) -> None:
                 sign = "+" if r["ml_pred"] >= 0 else ""
                 print(f"   {reason} exit fired — overridden: pred {sign}{r['ml_pred']:.2f}%  "
                       f">  threshold {r['ml_threshold']:+.1f}%  → staying long")
+                if r["exit_reason"] == "trail":
+                    print(f"   Trail re-anchored at today's close — stop below is the new effective level")
             print(f"   ── OPEN TRADE ─────────────────────────────────────────────────")
             print(f"   Entry : ${r['entry_price']:.2f}  on  {edate}")
             print(f"   Peak  : ${r['peak']:.2f}   |   Unrealised : {pnl_str}")
